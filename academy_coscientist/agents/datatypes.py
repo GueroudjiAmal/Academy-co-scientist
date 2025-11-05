@@ -1,9 +1,10 @@
 # academy_coscientist/agents/datatypes.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Any
 import uuid
+from dataclasses import dataclass
+from dataclasses import field
+from typing import Any
 
 
 def _new_id() -> str:
@@ -15,9 +16,9 @@ class Hypothesis:
     id: str
     text: str
     origin: str
-    metadata: Dict[str, Any] | None = field(default_factory=dict)
+    metadata: dict[str, Any] | None = field(default_factory=dict)
     elo: float = 1200.0
-    history: List[str] = field(default_factory=list)
+    history: list[str] = field(default_factory=list)
 
 
 @dataclass

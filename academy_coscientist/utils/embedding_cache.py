@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import os
 import json
-from typing import Dict, Any, List, Tuple
+import os
+from typing import Any
+
 from academy_coscientist.utils.utils_llm import embed_texts
 from academy_coscientist.utils.utils_logging import make_struct_logger
 
-EMBED_DIR = "embeddings"
+EMBED_DIR = 'embeddings'
 
 
 def _ensure_embed_dir() -> None:
@@ -14,16 +15,16 @@ def _ensure_embed_dir() -> None:
 
 
 def _cache_path_for_pdf(pdf_name: str) -> str:
-    safe_name = pdf_name.replace("/", "_")
-    return os.path.join(EMBED_DIR, f"{safe_name}.json")
+    safe_name = pdf_name.replace('/', '_')
+    return os.path.join(EMBED_DIR, f'{safe_name}.json')
 
 
-def _load_pdf_cache(pdf_name: str) -> List[Dict[str, Any]]:
+def _load_pdf_cache(pdf_name: str) -> list[dict[str, Any]]:
     path = _cache_path_for_pdf(pdf_name)
     if not os.path.isfile(path):
         return []
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding='utf-8') as f:
             data = json.load(f)
         if isinstance(data, list):
             return data
@@ -32,18 +33,17 @@ def _load_pdf_cache(pdf_name: str) -> List[Dict[str, Any]]:
         return []
 
 
-def _save_pdf_cache(pdf_name: str, rows: List[Dict[str, Any]]) -> None:
+def _save_pdf_cache(pdf_name: str, rows: list[dict[str, Any]]) -> None:
     path = _cache_path_for_pdf(pdf_name)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
 
 async def build_embeddings_with_cache(
-    texts: List[str],
-    metas: List[Dict[str, Any]],
-) -> List[List[float]]:
-    """
-    Given parallel lists:
+    texts: list[str],
+    metas: list[dict[str, Any]],
+) -> list[list[float]]:
+    """Given parallel lists:
         texts[i] = chunk text
         metas[i] = {
             "source_file": str,
@@ -60,57 +60,57 @@ async def build_embeddings_with_cache(
       - For missing ones, call embed_texts() and then update caches.
       - Return embeddings list aligned with `texts`.
     """
-    logger = make_struct_logger("EmbeddingCache")
+    logger = make_struct_logger('EmbeddingCache')
     _ensure_embed_dir()
 
     # Load all caches, group rows per PDF name, and map keys.
     # cache_maps[pdf]["<chunk_index>:<size>:<mtime>"] = embedding
-    cache_rows_by_pdf: Dict[str, List[Dict[str, Any]]] = {}
-    cache_maps: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    cache_rows_by_pdf: dict[str, list[dict[str, Any]]] = {}
+    cache_maps: dict[str, dict[str, dict[str, Any]]] = {}
 
-    unique_pdfs = {m["source_file"] for m in metas if "source_file" in m}
+    unique_pdfs = {m['source_file'] for m in metas if 'source_file' in m}
     for pdf_name in unique_pdfs:
         rows = _load_pdf_cache(pdf_name)
         cache_rows_by_pdf[pdf_name] = rows
-        mp: Dict[str, Dict[str, Any]] = {}
+        mp: dict[str, dict[str, Any]] = {}
         for r in rows:
-            ck = f"{r.get('chunk_index')}:{r.get('file_size')}:{r.get('file_mtime')}"
+            ck = f'{r.get("chunk_index")}:{r.get("file_size")}:{r.get("file_mtime")}'
             mp[ck] = r
         cache_maps[pdf_name] = mp
 
     logger.debug(
-        "loaded existing caches",
+        'loaded existing caches',
         extra={
-            "num_pdfs": len(unique_pdfs),
-            "pdfs": list(unique_pdfs)[:10],
+            'num_pdfs': len(unique_pdfs),
+            'pdfs': list(unique_pdfs)[:10],
         },
     )
 
     # We'll gather which items we still need to embed.
-    embeddings_out: List[List[float]] = [None] * len(texts)  # type: ignore
-    missing_batch: List[str] = []
-    missing_meta_index: List[int] = []
+    embeddings_out: list[list[float]] = [None] * len(texts)  # type: ignore
+    missing_batch: list[str] = []
+    missing_meta_index: list[int] = []
 
-    for i, (t, m) in enumerate(zip(texts, metas)):
-        pdf_name = m["source_file"]
-        cidx = m["chunk_index"]
-        fsize = m["file_size"]
-        fmtime = m["file_mtime"]
+    for i, (t, m) in enumerate(zip(texts, metas, strict=False)):
+        pdf_name = m['source_file']
+        cidx = m['chunk_index']
+        fsize = m['file_size']
+        fmtime = m['file_mtime']
 
-        ck = f"{cidx}:{fsize}:{fmtime}"
+        ck = f'{cidx}:{fsize}:{fmtime}'
         cached_row = cache_maps[pdf_name].get(ck)
 
-        if cached_row and "embedding" in cached_row:
-            embeddings_out[i] = cached_row["embedding"]
+        if cached_row and 'embedding' in cached_row:
+            embeddings_out[i] = cached_row['embedding']
         else:
             missing_batch.append(t)
             missing_meta_index.append(i)
 
     logger.debug(
-        "cache lookup done",
+        'cache lookup done',
         extra={
-            "total_chunks": len(texts),
-            "missing": len(missing_batch),
+            'total_chunks': len(texts),
+            'missing': len(missing_batch),
         },
     )
 
@@ -119,7 +119,7 @@ async def build_embeddings_with_cache(
     if missing_batch:
         new_embs = await embed_texts(
             missing_batch,
-            context={"stage": "embedding_cache_build"},
+            context={'stage': 'embedding_cache_build'},
         )
         # assign back
         for j, emb in enumerate(new_embs):
@@ -129,10 +129,10 @@ async def build_embeddings_with_cache(
     # Now we must update / write cache_rows_by_pdf for each new item
     for global_i in missing_meta_index:
         m = metas[global_i]
-        pdf_name = m["source_file"]
-        cidx = m["chunk_index"]
-        fsize = m["file_size"]
-        fmtime = m["file_mtime"]
+        pdf_name = m['source_file']
+        cidx = m['chunk_index']
+        fsize = m['file_size']
+        fmtime = m['file_mtime']
         text_val = texts[global_i]
         emb_val = embeddings_out[global_i]
 
@@ -142,23 +142,23 @@ async def build_embeddings_with_cache(
         replaced = False
         for row in cache_rows:
             if (
-                row.get("chunk_index") == cidx
-                and row.get("file_size") == fsize
-                and row.get("file_mtime") == fmtime
+                row.get('chunk_index') == cidx
+                and row.get('file_size') == fsize
+                and row.get('file_mtime') == fmtime
             ):
-                row["text"] = text_val
-                row["embedding"] = emb_val
+                row['text'] = text_val
+                row['embedding'] = emb_val
                 replaced = True
                 break
         if not replaced:
             cache_rows.append(
                 {
-                    "chunk_index": cidx,
-                    "file_size": fsize,
-                    "file_mtime": fmtime,
-                    "text": text_val,
-                    "embedding": emb_val,
-                }
+                    'chunk_index': cidx,
+                    'file_size': fsize,
+                    'file_mtime': fmtime,
+                    'text': text_val,
+                    'embedding': emb_val,
+                },
             )
         cache_rows_by_pdf[pdf_name] = cache_rows
 
@@ -167,9 +167,9 @@ async def build_embeddings_with_cache(
         _save_pdf_cache(pdf_name, rows)
 
     logger.debug(
-        "cache save complete",
+        'cache save complete',
         extra={
-            "updated_pdfs": list(cache_rows_by_pdf.keys())[:10],
+            'updated_pdfs': list(cache_rows_by_pdf.keys())[:10],
         },
     )
 
