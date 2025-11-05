@@ -1,133 +1,132 @@
-# academy_coscientist/agents/generation_agent.py
+# academy_coscientist/agents/hypothesis_agent.py
+
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, List, Optional
 
-from academy.agent import action
-from academy.agent import Agent
+from academy.agent import Agent, action
 
 from academy_coscientist.utils import utils_llm
-from academy_coscientist.utils.utils_logging import log_action
-from academy_coscientist.utils.utils_logging import make_struct_logger
+from academy_coscientist.utils.utils_logging import log_action, make_struct_logger
 
 
 class HypothesisGenerationAgent(Agent):
-    """Generates hypotheses for a given topic via LLM.
-    IMPORTANT: No implicit default count here — caller must pass n.
-    Includes a resilient local fallback so we never produce zero ideas.
+    """
+    Agent responsible for proposing candidate ideas / hypotheses for a topic.
+
+    - No deterministic "local" brainstorming fallback: all content comes from
+      OpenAI LLM calls via utils_llm.brainstorm_hypotheses.
+    - Designed to be topic-generic; domain comes entirely from the `topic` string.
     """
 
-    def __init__(self, topic: str | None = None) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.logger = make_struct_logger('HypothesisGenerationAgent')
-        self.topic: str | None = topic
+        self.logger = make_struct_logger("HypothesisGenerationAgent")
+        self._topic: Optional[str] = None
         self._tournament = None
-        self._ideas: list[dict[str, Any]] = []
-        self.logger.debug('HypothesisGenerationAgent init', extra={'has_topic': bool(topic)})
+        self._ideas: List[dict[str, Any]] = []
+
+    # ------------------- configuration -------------------
 
     @action
     async def set_topic(self, topic: str) -> None:
-        self.topic = topic
-        log_action(self.logger, 'set_topic', {'topic': topic}, {'ok': True})
-
-    @action
-    async def set_tournament(self, tournament_handle) -> None:
-        self._tournament = tournament_handle
+        self._topic = topic
         log_action(
-            self.logger, 'set_tournament', {'tournament': str(tournament_handle)}, {'ok': True}
+            self.logger,
+            "set_topic",
+            {"topic": topic},
+            {"ok": True},
         )
 
-    def _fallback_brainstorm(self, topic: str, n: int) -> list[dict[str, Any]]:
-        ideas: list[dict[str, Any]] = []
-        templates = [
-            'Benchmark {aspect} of {topic} using standardized workloads on representative HPC nodes.',
-            'Instrument {component} in {topic} pipelines to capture tail latency and scalability limits on HPC.',
-            'Prototype {approach} for {topic} and compare throughput vs. cost across HPC interconnects.',
-            'Design failure-injection tests for {topic} to measure resilience under HPC job schedulers.',
-            'Co-design data layout for {topic} to exploit NUMA & multi-socket patterns on HPC.',
-            'Evaluate hybrid CPU/GPU placement for {topic} under real HPC queues and preemption scenarios.',
-            'Quantify I/O contention effects on {topic} using synthetic and real traces on HPC FS.',
-            'Establish conformance tests for {topic} APIs under MPI/Slurm environments.',
-            'Model performance portability of {topic} across generations of HPC hardware.',
-            'Automate reproducible runs for {topic} with container and module systems on HPC.',
-        ]
-        aspects = [
-            ('end-to-end performance', 'indexing'),
-            ('latency under load', 'query execution'),
-            ('memory behavior', 'ingest path'),
-            ('fault tolerance', 'replication'),
-            ('scalability', 'sharding'),
-            ('scheduler integration', 'batching'),
-            ('I/O throughput', 'persistence'),
-            ('network sensitivity', 'consistency'),
-            ('portability', 'accelerators'),
-            ('reproducibility', 'observability'),
-        ]
-        for i in range(n):
-            t = templates[i % len(templates)]
-            a1, a2 = aspects[i % len(aspects)]
-            text = t.format(aspect=a1, component=a2, approach=a1, topic=topic)
-            ideas.append(
-                {
-                    'title': f'#{i + 1} {a1.title()} for {topic}',
-                    'description': text.strip(),
-                }
-            )
-        return ideas
+    @action
+    async def set_tournament(self, tournament) -> None:
+        """
+        Tournament agent handle. We expect it to implement either:
+
+        - add_hypotheses(list[dict]):
+            each dict is a hypothesis/idea, or
+
+        - add(payload: dict):
+            called one by one.
+
+        This keeps the agent generic and decoupled from specific tournament
+        implementations.
+        """
+        self._tournament = tournament
+        log_action(
+            self.logger,
+            "set_tournament",
+            {"tournament": str(tournament)},
+            {"ok": True},
+        )
+
+    # ------------------- main behavior -------------------
 
     @action
     async def propose_hypotheses(self, n: int | None = None) -> None:
-        """Generate hypotheses for self.topic.
-        - n must be provided by the caller (no implicit defaults).
-        - Guarantees non-empty output by using a local fallback if the LLM returns none.
         """
-        if not self.topic:
-            raise RuntimeError('Topic not set on HypothesisGenerationAgent')
-        if n is None:
-            raise RuntimeError("propose_hypotheses requires 'n' (no implicit default)")
+        Generate `n` candidate hypotheses / ideas using the LLM.
 
-        ideas: list[dict[str, Any]] = []
-        llm_error = None
+        No deterministic content fallback:
+        - If the LLM call fails, we log and raise.
+        - We never fabricate ideas locally.
+        """
+        if not self._topic:
+            raise RuntimeError("HypothesisGenerationAgent: topic not set")
+
+        if n is None:
+            raise RuntimeError("propose_hypotheses requires 'n'")
+
+        topic = self._topic
+
         try:
             ideas = await utils_llm.brainstorm_hypotheses(
-                topic=self.topic,
+                topic=topic,
                 n=int(n),
-                context={'agent': 'HypothesisGenerationAgent', 'action': 'brainstorm'},
+                context={
+                    "agent": "HypothesisGenerationAgent",
+                    "action": "brainstorm",
+                    "instance_id": getattr(self, "instance_id", None),
+                    "audit_path": getattr(self, "audit_path", None),
+                },
             )
-            if not isinstance(ideas, list):
-                ideas = []
         except Exception as e:
-            llm_error = repr(e)
-            ideas = []
+            self.logger.exception(
+                "brainstorm_failed",
+                extra={
+                    "error": repr(e),
+                    "topic": topic,
+                    "n_requested": n,
+                },
+            )
+            raise
 
-        if len(ideas) < int(n):
-            fallback_needed = int(n) - len(ideas)
-            fallback = self._fallback_brainstorm(self.topic, fallback_needed)
-            ideas = (ideas or []) + fallback
-
-        if len(ideas) > int(n):
-            ideas = ideas[: int(n)]
+        if not isinstance(ideas, list):
+            raise RuntimeError(
+                f"LLM brainstorm returned non-list: {type(ideas)!r}"
+            )
 
         self._ideas = ideas
-
         added = 0
+
         if self._tournament and self._ideas:
-            if hasattr(self._tournament, 'add_hypotheses'):
+            if hasattr(self._tournament, "add_hypotheses"):
                 await self._tournament.add_hypotheses(self._ideas)
                 added = len(self._ideas)
-            elif hasattr(self._tournament, 'add'):
+            elif hasattr(self._tournament, "add"):
                 for idea in self._ideas:
                     await self._tournament.add(idea)
                     added += 1
 
         log_action(
             self.logger,
-            'propose_hypotheses',
-            {'topic': self.topic, 'n_requested': n, 'llm_error': llm_error},
-            {'n_generated': len(self._ideas), 'n_added_to_tournament': added},
+            "propose_hypotheses",
+            {"topic": topic, "n_requested": n},
+            {"n_generated": len(self._ideas), "n_added_to_tournament": added},
         )
+
+    # ------------------- accessors -------------------
 
     @action
     async def get_ideas(self) -> list[dict[str, Any]]:
-        log_action(self.logger, 'get_ideas', {'requested': True}, {'count': len(self._ideas)})
         return list(self._ideas)

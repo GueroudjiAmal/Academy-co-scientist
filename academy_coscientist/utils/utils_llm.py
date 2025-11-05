@@ -2,1201 +2,522 @@
 from __future__ import annotations
 
 import json
-import os
-import random
-from typing import Any
+from typing import Any, Iterable, List, Optional
 
-from openai import APIStatusError
 from openai import AsyncOpenAI
-from openai import RateLimitError
-
+import openai
 from academy_coscientist.utils.config import get_model
-from academy_coscientist.utils.utils_logging import get_llm_audit_path
-from academy_coscientist.utils.utils_logging import record_llm_call
+from academy_coscientist.utils.utils_logging import make_struct_logger
 
-# ------------------------- OpenAI / Embedding setup ---------------------------
-
-_LOCAL_EMBEDDER_CACHE: dict[str, Any] = {}
-
-try:
-    from sentence_transformers import SentenceTransformer
-except ImportError:
-    SentenceTransformer = None  # type: ignore
-
-_client = AsyncOpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
-
-_last_known_embed_dim: int | None = None
+_client = AsyncOpenAI()
+_logger = make_struct_logger("utils_llm")
 
 
-def _is_local_embedding_model(name: str) -> bool:
-    return str(name).strip().lower().startswith('local-')
+# ---------------------------------------------------------------------------
+# Low-level chat + JSON helpers
+# ---------------------------------------------------------------------------
 
 
-def _local_model_name_from_config(name: str) -> str:
-    return name.split('local-', 1)[1] if 'local-' in name else name
-
-
-def _get_local_embedder(model_name: str):
-    global _LOCAL_EMBEDDER_CACHE, SentenceTransformer
-    if model_name in _LOCAL_EMBEDDER_CACHE:
-        return _LOCAL_EMBEDDER_CACHE[model_name]
-    if SentenceTransformer is None:
-        raise RuntimeError(
-            'sentence-transformers not installed, but a local embedding model was requested.',
-        )
-    model = SentenceTransformer(model_name)
-    _LOCAL_EMBEDDER_CACHE[model_name] = model
-    return model
-
-
-# --------------------------- Safe JSON serializers ----------------------------
-
-
-def _to_safe_json(x, depth: int = 0, max_depth: int = 4):
-    """Recursively convert SDK / pydantic objects to plain JSONable structures."""
-    if x is None:
-        return None
-    if isinstance(x, (str, int, float, bool)):
-        return x
-    if depth >= max_depth:
-        s = str(x)
-        return s[:2000] + ('...' if len(s) > 2000 else '')
-    if isinstance(x, dict):
-        return {k: _to_safe_json(v, depth + 1, max_depth) for k, v in x.items()}
-    if isinstance(x, (list, tuple, set)):
-        return [_to_safe_json(v, depth + 1, max_depth) for v in x]
-    # pydantic v2 models in the OpenAI SDK expose model_dump()
-    if hasattr(x, 'model_dump') and callable(x.model_dump):
-        try:
-            return _to_safe_json(x.model_dump(), depth + 1, max_depth)
-        except Exception:
-            pass
-    # generic objects
-    try:
-        d = vars(x)
-        return _to_safe_json(d, depth + 1, max_depth)
-    except Exception:
-        s = str(x)
-        return s[:2000] + ('...' if len(s) > 2000 else '')
-
-
-def _extract_reasoning_text_from_dump(d: dict) -> str:
-    """Best-effort: walk the dumped response dict to collect any 'reasoning' items' text.
-    The Responses API represents output as a list of items; some items have type='reasoning'.
-    """
-    texts = []
-
-    def walk(node):
-        if isinstance(node, dict):
-            t = node.get('type')
-            if t == 'reasoning':
-                txt = node.get('text') or node.get('content') or node.get('value')
-                if isinstance(txt, str):
-                    texts.append(txt)
-                elif isinstance(txt, list):
-                    segs = [s for s in txt if isinstance(s, str)]
-                    if segs:
-                        texts.append('\n'.join(segs))
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    walk(d)
-    out = '\n'.join(texts).strip()
-    return out[:4000] + ('...' if len(out) > 4000 else '')
-
-
-# ------------------------------ Embeddings ------------------------------------
-
-
-async def _embed_with_local_model(
-    model_alias: str,
-    texts: list[str],
-    ctx: dict[str, Any],
-) -> list[list[float]]:
-    global _last_known_embed_dim
-
-    audit_path = ctx.get('audit_path', get_llm_audit_path())
-    raw_name = _local_model_name_from_config(model_alias)
-
-    record_llm_call(
-        {
-            'type': 'embed_request_local',
-            'model': raw_name,
-            'alias': model_alias,
-            'temperature': None,
-            'input_texts_preview': [t[:300] for t in texts[:3]],
-            'count': len(texts),
-            'context': ctx,
-        },
-        mirror_to=audit_path,
-    )
-
-    try:
-        st_model = _get_local_embedder(raw_name)
-        vectors_np = st_model.encode(
-            texts,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
-        vectors = [v.tolist() for v in vectors_np]
-
-        if vectors:
-            _last_known_embed_dim = len(vectors[0])
-
-        record_llm_call(
-            {
-                'type': 'embed_response_local',
-                'model': raw_name,
-                'alias': model_alias,
-                'temperature': None,
-                'count': len(vectors),
-                'dim': _last_known_embed_dim,
-                'context': ctx,
-            },
-            mirror_to=audit_path,
-        )
-        return vectors
-
-    except Exception as e:
-        dim = _last_known_embed_dim if _last_known_embed_dim is not None else 256
-        fallback_vectors = [[0.0] * dim for _ in texts]
-
-        record_llm_call(
-            {
-                'type': 'embed_error_local',
-                'model': raw_name,
-                'alias': model_alias,
-                'temperature': None,
-                'error': repr(e),
-                'used_fallback_dim': dim,
-                'context': ctx,
-            },
-            mirror_to=audit_path,
-        )
-        return fallback_vectors
-
-
-async def _embed_with_openai_model(
-    model_name: str,
-    texts: list[str],
-    ctx: dict[str, Any],
-) -> list[list[float]]:
-    global _last_known_embed_dim
-
-    audit_path = ctx.get('audit_path', get_llm_audit_path())
-
-    record_llm_call(
-        {
-            'type': 'embed_request_openai',
-            'model': model_name,
-            'temperature': None,
-            'input_texts_preview': [t[:300] for t in texts[:3]],
-            'count': len(texts),
-            'context': ctx,
-        },
-        mirror_to=audit_path,
-    )
-
-    try:
-        resp = await _client.embeddings.create(
-            model=model_name,
-            input=texts,
-        )
-        vectors = [d.embedding for d in resp.data]
-
-        if vectors and isinstance(vectors[0], list):
-            _last_known_embed_dim = len(vectors[0])
-
-        record_llm_call(
-            {
-                'type': 'embed_response_openai',
-                'model': model_name,
-                'temperature': None,
-                'count': len(vectors),
-                'dim': _last_known_embed_dim,
-                'context': ctx,
-            },
-            mirror_to=audit_path,
-        )
-        return vectors
-
-    except Exception as e:
-        dim = _last_known_embed_dim if _last_known_embed_dim is not None else 256
-        fallback_vectors = [[0.0] * dim for _ in texts]
-
-        record_llm_call(
-            {
-                'type': 'embed_error_openai',
-                'model': model_name,
-                'temperature': None,
-                'error': repr(e),
-                'used_fallback_dim': dim,
-                'context': ctx,
-            },
-            mirror_to=audit_path,
-        )
-        return fallback_vectors
-
-
-async def embed_texts(
-    texts: list[str],
-    context: dict[str, Any] | None = None,
-) -> list[list[float]]:
-    """Front-door for embedding calls."""
-    ctx = context or {}
-    embed_model = get_model('embedding')
-
-    if _is_local_embedding_model(embed_model):
-        return await _embed_with_local_model(embed_model, texts, ctx)
-    else:
-        return await _embed_with_openai_model(embed_model, texts, ctx)
-
-
-# --------------------------- Text LLM helpers ---------------------------------
-
-
-async def _call_openai_responses(
-    model: str,
-    system_instructions: str,
-    user_input: str,
-    allow_temperature: bool = False,
-    temperature_value: float = 0.4,
-    context: dict[str, Any] | None = None,
+async def _chat(
+    purpose: str,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    temperature: float = 0.4,
+    max_tokens: int = 2048,
+    context: Optional[dict[str, Any]] = None,
 ) -> str:
-    """Low-level Responses API wrapper (text output).
-    Fully logged to llm_calls.jsonl with safe, JSON-serializable payloads.
     """
+    Unified, version-safe chat wrapper for all OpenAI models.
+
+    Handles:
+      - reasoning models (o1, o3, o4-mini, etc.)
+      - legacy chat models (gpt-4o, gpt-3.5-turbo)
+      - parameter compatibility (`max_tokens` vs `max_completion_tokens`)
+      - temperature restrictions
+    """
+    model = get_model(purpose)
     ctx = context or {}
-    audit_path = ctx.get('audit_path', get_llm_audit_path())
 
-    llm_record: dict[str, Any] = {
-        'type': 'responses_call',
-        'model': model,
-        'temperature': temperature_value if allow_temperature else None,
-        'system_instructions': system_instructions,
-        'user_input': user_input,
-        'context': ctx,
-    }
+    _logger.debug(
+        "llm_chat_start",
+        extra={"purpose": purpose, "model": model, "temperature": temperature, "max_tokens": max_tokens},
+    )
 
+    messages = [
+        {"role": "system", "content": system_prompt.strip()},
+        {"role": "user", "content": user_prompt.strip()},
+    ]
+
+    # Detect if the model is a reasoning model
+    is_reasoning = any(tag in model for tag in ("o1", "o3", "o4", "mini", "reasoning"))
+
+    # Build kwargs dynamically
+    kwargs = dict(model=model, messages=messages)
+
+    # Reasoning models: temperature must be omitted
+    if not is_reasoning:
+        kwargs["temperature"] = temperature
+
+    # Try the new-style param first
     try:
-        if allow_temperature:
-            resp = await _client.responses.create(
-                model=model,
-                instructions=system_instructions,
-                input=user_input,
-                temperature=temperature_value,
+        resp = await _client.chat.completions.create(
+            **kwargs, max_completion_tokens=max_tokens
+        )
+    except openai.BadRequestError as e:
+        msg = str(e).lower()
+        if "unsupported_parameter" in msg or "max_tokens" in msg:
+            # fallback to legacy parameter name
+            resp = await _client.chat.completions.create(
+                **kwargs, max_tokens=max_tokens
+            )
+        elif "temperature" in msg or "unsupported_value" in msg:
+            # retry without temperature for reasoning models
+            kwargs.pop("temperature", None)
+            resp = await _client.chat.completions.create(
+                **kwargs, max_completion_tokens=max_tokens
             )
         else:
-            resp = await _client.responses.create(
-                model=model,
-                instructions=system_instructions,
-                input=user_input,
-            )
+            raise
+    except TypeError:
+        # compatibility fallback for old SDKs
+        resp = await _client.chat.completions.create(
+            **kwargs, max_tokens=max_tokens
+        )
 
-        text = resp.output_text.strip()
+    text = resp.choices[0].message.content or ""
+    out = text.strip()
 
-        # Safely serialize for logs
-        try:
-            dumped = resp.model_dump()  # pydantic v2 on SDK objects
-        except Exception:
-            dumped = _to_safe_json(resp)  # fallback, still JSONable
+    _logger.debug(
+        "llm_chat_done",
+        extra={"purpose": purpose, "model": model, "context": ctx, "output_preview": out[:200]},
+    )
 
-        reasoning_text = ''
-        try:
-            if isinstance(dumped, dict):
-                reasoning_text = _extract_reasoning_text_from_dump(dumped)
-        except Exception:
-            reasoning_text = ''
+    return out
 
-        llm_record['raw_response_text'] = text
-        llm_record['parsed_response'] = text
-        llm_record['reasoning'] = {
-            'reasoning_text': reasoning_text,
-            'response_dump_snippet': _to_safe_json(dumped),
-        }
-        llm_record['error'] = None
 
-        record_llm_call(llm_record, mirror_to=audit_path)
+
+def _extract_json_block(text: str) -> str:
+    """
+    Best-effort JSON extraction.
+
+    We do *not* invent content here; we simply try to trim away markdown
+    fences or stray commentary so that the remaining text is valid JSON.
+    If this fails, the caller is responsible for handling the parse error.
+    """
+    text = text.strip()
+
+    # Strip ```json fences if present.
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].startswith("```"):
+            text = "\n".join(lines[1:-1]).strip()
+
+    # Already-valid JSON?
+    try:
+        json.loads(text)
+        return text
+    except Exception:
+        pass
+
+    # Try slice from first { / [ to last } / ]
+    first = len(text)
+    for ch in ("{", "["):
+        idx = text.find(ch)
+        if idx != -1:
+            first = min(first, idx)
+
+    last = -1
+    for ch in ("}", "]"):
+        idx = text.rfind(ch)
+        if idx != -1:
+            last = max(last, idx)
+
+    if first >= last or last == -1 or first == len(text):
         return text
 
-    except (RateLimitError, APIStatusError, Exception) as e:
-        llm_record['raw_response_text'] = ''
-        llm_record['parsed_response'] = ''
-        llm_record['reasoning'] = None
-        llm_record['error'] = repr(e)
-        record_llm_call(llm_record, mirror_to=audit_path)
-        return ''
-
-
-# ---------------------------------------------------------------------------
-# Text-only LLM helper with robust fallback
-# ---------------------------------------------------------------------------
-
-import logging
-
-logger = logging.getLogger(__name__)
-
-# Make sure this global exists somewhere in your file:
-try:
-    LLM_DEGRADED
-except NameError:
-    LLM_DEGRADED = False  # type: ignore[assignment]
-
-
-async def _call_llm_text(system_msg: str, user_msg: str) -> str:
-    """Thin wrapper around the OpenAI Responses API that returns plain text.
-
-    If no client/model is available or an error occurs, it falls back to
-    returning the user message (deterministic, non-empty).
-    """
-    global LLM_DEGRADED
-
-    # If the client or model isn't configured, degrade gracefully
-    if '_client' not in globals() or '_MODEL' not in globals() or globals().get('_client') is None:
-        LLM_DEGRADED = True
-        logger.warning(
-            'LLM client/model not available in _call_llm_text; falling back to deterministic text.',
-        )
-        return user_msg
-
-    client = globals()['_client']
-    model = globals()['_MODEL']
-
-    try:
-        resp = await client.responses.create(
-            model=model,
-            input=[
-                {'role': 'system', 'content': system_msg},
-                {'role': 'user', 'content': user_msg},
-            ],
-        )
-
-        # Try to extract text from Responses API output
-        try:
-            output_item = resp.output[0]
-            content_item = output_item.content[0]
-
-            # Newer SDK: content_item.text.value
-            text_obj = getattr(content_item, 'text', None)
-            if text_obj is not None:
-                value = getattr(text_obj, 'value', None)
-                if isinstance(value, str) and value.strip():
-                    return value
-
-            # Fallback if it's a dict-like structure
-            if isinstance(content_item, dict):
-                t = content_item.get('text')
-                if isinstance(t, dict) and 'value' in t and isinstance(t['value'], str):
-                    return t['value']
-                if isinstance(t, str) and t.strip():
-                    return t
-
-        except Exception:
-            # If parsing fails, fall back to stringifying the whole response
-            logger.debug('Failed to parse Responses API text output; using str(resp).')
-
-        # Last-ditch: string representation of response
-        s = str(resp)
-        return s if s.strip() else user_msg
-
-    except Exception as e:
-        LLM_DEGRADED = True
-        logger.exception(
-            'LLM text call failed in _call_llm_text; using deterministic fallback.',
-            extra={'error': repr(e)},
-        )
-        return user_msg
-
-
-# ---------------------------------------------------------------------------
-# Generic structured expansion helper with deterministic fallback
-# ---------------------------------------------------------------------------
-
-
-async def structured_expand(*args, **kwargs) -> str:
-    """Generic helper for section-level expansions with LLM + deterministic fallback.
-
-    It is intentionally permissive so it can handle different call styles, e.g.:
-
-        await structured_expand(system_msg, user_msg, schema_hint)
-        await structured_expand(system_msg=..., user_msg=..., schema_hint=...)
-        await structured_expand(system_msg=..., user_msg=..., fallback_text="...")
-
-    Behavior:
-      - If `schema_hint` is provided, it calls `_call_llm_json(...)` and tries
-        to convert the result into text.
-      - Otherwise, it calls `_call_llm_text(...)`.
-      - On *any* failure or empty response, it returns a deterministic,
-        non-empty fallback based on `fallback_text` or `user_msg`.
-    """
-    global LLM_DEGRADED
-
-    system_msg = None
-    user_msg = None
-    schema_hint = None
-    fallback_text = None
-
-    # Positional unpacking: (system_msg, user_msg, schema_hint?)
-    if args:
-        if len(args) >= 1:
-            system_msg = args[0]
-        if len(args) >= 2:
-            user_msg = args[1]
-        if len(args) >= 3:
-            schema_hint = args[2]
-
-    # Keyword overrides
-    system_msg = kwargs.get('system_msg', system_msg)
-    user_msg = kwargs.get('user_msg', user_msg)
-    schema_hint = kwargs.get('schema_hint', schema_hint)
-    fallback_text = kwargs.get('fallback_text', fallback_text)
-
-    # Ensure we have something deterministic to return if everything else fails
-    if user_msg is None:
-        user_msg = 'No user prompt provided.'
-
-    # If system message is missing, still proceed — LLMs can handle that.
-    if system_msg is None:
-        system_msg = 'You are a helpful scientific writing assistant.'
-
-    # If no LLM JSON helper is available, skip to text-only mode
-    use_json = schema_hint is not None and '_call_llm_json' in globals()
-
-    try:
-        if use_json:
-            data = await globals()['_call_llm_json'](system_msg, user_msg, schema_hint)
-
-            # Try to interpret the JSON-structured response as text
-            if isinstance(data, dict):
-                # If the schema has a 'text' or 'content' field, use that
-                for key in ('text', 'content', 'body'):
-                    val = data.get(key)
-                    if isinstance(val, str) and val.strip():
-                        return val
-                # Otherwise pretty-print the JSON as a deterministic representation
-                return json.dumps(data, indent=2, sort_keys=True)
-
-            if isinstance(data, list):
-                # Join list items as bullet points
-                lines = [f'- {item!s}' for item in data]
-                return '\n'.join(lines)
-
-            # Fallback: string representation
-            s = str(data)
-            return s if s.strip() else (fallback_text or user_msg)
-
-        # Text-only path
-        text = await _call_llm_text(system_msg, user_msg)
-        if text and text.strip():
-            return text
-
-        # If we reach here, treat as failure and fall through to deterministic fallback
-        raise ValueError('Empty LLM response in structured_expand')
-
-    except Exception as e:
-        LLM_DEGRADED = True
-        logger.exception(
-            'structured_expand LLM failed; using deterministic fallback.',
-            extra={'error': repr(e)},
-        )
-
-        if fallback_text and str(fallback_text).strip():
-            return str(fallback_text)
-
-        # Generic deterministic fallback using the prompt itself
-        return 'LLM expansion unavailable. Deterministic summary based on the prompt:\n\n' + str(
-            user_msg
-        )
+    return text[first : last + 1].strip()
 
 
 async def _call_llm_json(
     system_instructions: str,
     user_prompt: str,
     schema_hint: str,
-    context: dict[str, Any] | None = None,
+    *,
+    purpose: str = "reasoning",
+    temperature: float = 0.3,
+    max_tokens: int = 2048,
+    context: Optional[dict[str, Any]] = None,
 ) -> Any:
-    """Ask the reasoning model for STRICT JSON following schema_hint.
-    Parse + log; if empty, parsed becomes {} and a fallback can be applied upstream.
     """
-    ctx = context or {}
-    audit_path = ctx.get('audit_path', get_llm_audit_path())
+    Shared JSON helper.
 
-    reasoning_model = get_model('reasoning')
-
-    formatted_user_prompt = (
-        f'{user_prompt}\n\n'
-        'You MUST respond with ONLY valid JSON, no markdown fences, '
-        'no commentary, and only the requested keys.\n'
-        'Target JSON shape:\n'
-        f'{schema_hint}\n'
-        'Return ONLY that JSON.'
+    IMPORTANT: there is no deterministic JSON fabrication here.
+    If the model output cannot be parsed as JSON even after light cleanup,
+    json.loads(...) will raise and that exception is propagated.
+    """
+    sys_prompt = (
+        system_instructions.strip()
+        + "\n\nYou MUST reply with STRICT JSON only. "
+        "Do not include markdown code fences, prose, or explanations.\n"
+        "Intended JSON shape (natural language description):\n"
+        f"{schema_hint.strip()}\n"
     )
 
-    llm_text = await _call_openai_responses(
-        model=reasoning_model,
+    raw = await _chat(
+        purpose=purpose,
+        system_prompt=sys_prompt,
+        user_prompt=user_prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        context=context,
+    )
+
+    json_text = _extract_json_block(raw)
+    return json.loads(json_text)
+
+
+async def call_llm_json(
+    system_instructions: str,
+    user_prompt: str,
+    schema_hint: str,
+    *,
+    purpose: str = "reasoning",
+    temperature: float = 0.3,
+    max_tokens: int = 2048,
+    context: Optional[dict[str, Any]] = None,
+) -> Any:
+    """
+    Public wrapper used by downstream agents (e.g. ReportAgent).
+
+    This just forwards to `_call_llm_json` with explicit keyword arguments,
+    so signatures remain stable and easy to audit.
+    """
+    return await _call_llm_json(
         system_instructions=system_instructions,
-        user_input=formatted_user_prompt,
-        allow_temperature=False,
-        context={
-            **ctx,
-            'call_type': 'json',
-            'schema_hint': schema_hint,
-        },
+        user_prompt=user_prompt,
+        schema_hint=schema_hint,
+        purpose=purpose,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        context=context,
     )
 
-    fallback_used = False
-    if not llm_text:
-        fallback_used = True
-        llm_text = '{}'
 
-    # attempt strict JSON recovery
-    start_obj = llm_text.find('{')
-    start_arr = llm_text.find('[')
-    if start_obj == -1 or (start_arr != -1 and start_arr < start_obj):
-        start_idx = start_arr
-    else:
-        start_idx = start_obj
+# ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
 
-    if start_idx == -1:
-        parsed: Any = {}
-    else:
-        end_curly = llm_text.rfind('}')
-        end_brack = llm_text.rfind(']')
-        end_idx = max(end_curly, end_brack)
-        candidate = llm_text[start_idx : end_idx + 1]
-        try:
-            parsed = json.loads(candidate)
-        except Exception:
-            parsed = {}
+_embedder_model = None
 
-    record_llm_call(
-        {
-            'type': 'parsed_json_result',
-            'model': reasoning_model,
-            'temperature': None,
-            'system_instructions': system_instructions,
-            'user_prompt': user_prompt,
-            'schema_hint': schema_hint,
-            'raw_response_text': llm_text,
-            'parsed_response': parsed,
-            'fallback_used': fallback_used,
-            'context': ctx,
-        },
-        mirror_to=audit_path,
+
+async def embed_texts(
+    texts: Iterable[str],
+    *,
+    context: Optional[dict[str, Any]] = None,
+) -> List[List[float]]:
+    """
+    Compute embeddings for a batch of texts.
+
+    Behaviour:
+    - If config.models.embedding starts with 'local-', we use a SMALL local
+      sentence-transformer model (e.g. all-MiniLM-L6-v2).
+    - Otherwise we call OpenAI's embeddings endpoint with that model name.
+
+    This aligns with the constraint:
+      - use OpenAI for LLM calls
+      - only use a small local model for embeddings if needed.
+    """
+    from typing import cast
+
+    global _embedder_model
+    ctx = context or {}
+    embed_model = get_model("embedding")
+
+    texts_list = [str(t) for t in texts]
+
+    # Local path
+    if embed_model.startswith("local-"):
+        model_name = embed_model[len("local-") :] or "all-MiniLM-L6-v2"
+        if _embedder_model is None:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+
+            _logger.info(
+                "embed_init_local",
+                extra={"model": model_name},
+            )
+            _embedder_model = SentenceTransformer(model_name)
+        vecs = _embedder_model.encode(
+            texts_list,
+            convert_to_numpy=False,
+            show_progress_bar=False,
+        )
+        return [list(map(float, v)) for v in vecs]
+
+    # Remote OpenAI embeddings
+    resp = await _client.embeddings.create(
+        model=embed_model,
+        input=texts_list,
     )
+    out: List[List[float]] = [
+        cast(List[float], d.embedding) for d in resp.data
+    ]
 
-    return parsed
-
-
-# ---------------- Agent self commentary (used by Supervisor) ------------------
-
-
-async def agent_self_commentary(
-    agent_name: str,
-    state_snapshot: dict[str, Any],
-    context: dict[str, Any] | None = None,
-) -> str:
-    reasoning_model = get_model('reasoning')
-    compact_state = json.dumps(state_snapshot, ensure_ascii=False)[:2000]
-
-    system_msg = (
-        'You are an autonomous research audit assistant. '
-        "Your job: briefly summarize an agent's current state for engineers. "
-        'Be concise (1-2 sentences), concrete, and factual. '
-        'Do not invent data.'
+    _logger.debug(
+        "embed_done",
+        extra={"model": embed_model, "n": len(out), "context": ctx},
     )
-
-    user_msg = (
-        f'Agent `{agent_name}` internal snapshot:\n'
-        f'{compact_state}\n\n'
-        'Write 1-2 sentence status, no bullet points.'
-    )
-
-    text = await _call_openai_responses(
-        model=reasoning_model,
-        system_instructions=system_msg,
-        user_input=user_msg,
-        allow_temperature=False,
-        context={
-            **(context or {}),
-            'call_type': 'self_commentary',
-            'agent_name': agent_name,
-        },
-    )
-
-    return text or f'[{agent_name} status unavailable]'
+    return out
 
 
-# ---------------------- Local fallbacks (no LLM needed) -----------------------
-
-
-def _seed_titles(topic: str, n: int) -> list[str]:
-    base = [
-        'Benchmarking Reliability Under Distribution Shift',
-        'Agent Self-Verification and Tool-Use Checks',
-        'Uncertainty-Aware Planning and Halting',
-        'Counterfactual Data Augmentation for Robustness',
-        'Eval Harness for Scientific Claims',
-        'Memory Hygiene & Provenance Tracking',
-        'Multi-Agent Cross-Examination',
-        'Grounded Retrieval with Trust Signals',
-        'Safety-Valve: Conservative Decoding on Risk',
-        'Rapid Postmortem & Feedback Loops',
-        'Human-in-the-Loop Triage for Edge Cases',
-        'Automated Reproduction Pipelines',
-        'Spec-First Protocol Generation',
-        'Open Lab Notebook Automation',
-        'Causal Tests for Tool Integration',
-    ]
-    random.seed(abs(hash(topic)) % (2**32))
-    random.shuffle(base)
-    return base[: max(10, n)]
-
-
-def _tshirt(i: int) -> str:
-    return ['XS', 'S', 'M', 'L', 'XL'][i % 5]
-
-
-def _timeline(i: int) -> int:
-    return [2, 4, 6, 8, 12, 16][i % 6]
-
-
-def _confidence(i: int) -> float:
-    return round(0.5 + 0.05 * ((i % 6) - 2), 2)  # ~0.4..0.6 band
-
-
-def _metrics(topic: str) -> list[dict[str, str]]:
-    return [
-        {'metric': 'reproduction_rate', 'target': '≥ 90% within 2 attempts', 'timeframe': 'pilot'},
-        {'metric': 'hallucination_rate', 'target': '≤ 1% on held-out tasks', 'timeframe': 'R1'},
-        {
-            'metric': 'verification_coverage',
-            'target': '≥ 85% of steps auto-checked',
-            'timeframe': 'R1',
-        },
-    ]
-
-
-def _plan() -> list[str]:
-    return [
-        'Define scope and success criteria with domain experts',
-        'Assemble or synthesize a representative task suite',
-        'Implement baseline and instrumentation for traces',
-        'Prototype approach; run A/B against baseline',
-        'Measure predefined metrics; analyze failures',
-        'Harden implementation; write reproducible recipe',
-        'Ship doc + code + dashboards',
-    ]
-
-
-def _risks() -> list[str]:
-    return [
-        'Metric gaming or overfitting to eval set',
-        'Tool/API variability across environments',
-        'Data leakage or unnoticed shortcuts',
-    ]
-
-
-def _mitigations() -> list[str]:
-    return [
-        'Holdout rotations and adversarial evals',
-        'Version pinning and containerized runners',
-        'Provenance checks and red-team probes',
-    ]
-
-
-def _local_idea(topic: str, title: str, i: int) -> dict[str, Any]:
-    return {
-        'title': title,
-        'rationale': f"Increase reliability for '{topic}' by addressing common failure modes and adding verifiable controls.",
-        'mechanism': 'Introduce checks, redundancy, and robust training/eval signals to reduce silent failures.',
-        'novelty': 'Combines verification, provenance, and uncertainty control into a practical pipeline.',
-        'dependencies': 'Task suite, logging/tracing infra, container build, basic RAG/store.',
-        'plan': _plan(),
-        'resources': '1 PM, 2 Eng, 1 DS; GPU access; CI/CD; observability stack',
-        'metrics': _metrics(topic),
-        'risks': _risks(),
-        'mitigations': _mitigations(),
-        'expected_outcome': 'Measurable lift in reproduction_rate and drop in hallucination_rate on target domain.',
-        'confidence': _confidence(i),
-        'timeline_weeks': _timeline(i),
-        'cost_tshirt': _tshirt(i),
-    }
-
-
-def _fmt_metrics(metrics: list[dict[str, Any]]) -> str:
-    lines = []
-    for m in metrics or []:
-        metric = m.get('metric', '')
-        target = m.get('target', '')
-        tf = m.get('timeframe', '')
-        parts = [p for p in [metric, target, tf] if p]
-        if parts:
-            lines.append('- ' + ' | '.join(parts))
-    return '\n'.join(lines) if lines else '- (none specified)'
-
-
-def _fmt_list(name: str, items: list[str]) -> str:
-    if not items:
-        return f'{name}:\n- (none)'
-    return f'{name}:\n' + '\n'.join(f'- {it}' for it in items)
-
-
-def _local_meta(ideas: list[tuple[str, float, dict[str, Any]]]) -> str:
-    if not ideas:
-        return '(no ideas)'
-    themes = {
-        'verification': 0,
-        'evals': 0,
-        'retrieval': 0,
-        'planning': 0,
-        'tooling': 0,
-        'observability': 0,
-    }
-    for _hid, _elo, idea in ideas:
-        t = (idea.get('title', '') + ' ' + idea.get('rationale', '')).lower()
-        if any(k in t for k in ['verify', 'check', 'self']):
-            themes['verification'] += 1
-        if 'eval' in t or 'benchmark' in t:
-            themes['evals'] += 1
-        if 'retriev' in t or 'rag' in t:
-            themes['retrieval'] += 1
-        if 'plan' in t or 'uncertainty' in t:
-            themes['planning'] += 1
-        if 'tool' in t or 'api' in t:
-            themes['tooling'] += 1
-        if 'log' in t or 'trace' in t or 'observ' in t:
-            themes['observability'] += 1
-
-    ordered = sorted(themes.items(), key=lambda x: x[1], reverse=True)
-    lines = ['**Themes (counts):** ' + ', '.join([f'{k}:{v}' for k, v in ordered if v > 0])]
-
-    # simple roadmap by ELO, batching
-    sorted_ideas = sorted(ideas, key=lambda x: x[1], reverse=True)
-    batches = [sorted_ideas[i : i + 3] for i in range(0, min(10, len(sorted_ideas)), 3)]
-    lines.append('\n**Prioritized roadmap:**')
-    for idx, batch in enumerate(batches, start=1):
-        ids = ', '.join([f'{hid} (ELO {elo:.0f})' for hid, elo, _ in batch])
-        lines.append(f'- Phase {idx}: {ids}')
-
-    return '\n'.join(lines)
-
-
-# ---------------- Enriched agent-level helpers (with fallbacks) ---------------
+# ---------------------------------------------------------------------------
+# High-level helpers used by agents
+# ---------------------------------------------------------------------------
 
 
 async def brainstorm_hypotheses(
     topic: str,
     n: int,
-    context: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    """LLM JSON brainstorm; if empty, produce a high-quality local top-10 set."""
-    n = max(n, 10)
-    system_msg = (
-        'You are a senior technical program designer. '
-        'Propose distinct, testable, HIGH-LEVERAGE ideas for the given topic. '
-        'Each idea must include a concrete plan, metrics, timeline, resources, '
-        'risks, mitigations, expected outcome and confidence.'
-    )
-    user_msg = (
-        f'Generate {n} distinct ideas for:\n{topic}\n\n'
-        'For each idea, fill these fields:\n'
-        '- title\n- rationale\n- mechanism\n- novelty\n- dependencies\n'
-        '- plan (5-8 bullets)\n- resources\n- metrics [{metric,target,timeframe}]\n'
-        '- risks (2-3)\n- mitigations (1-2 per risk)\n'
-        '- expected_outcome\n- confidence (0..1)\n- timeline_weeks (int)\n- cost_tshirt (XS..XL)\n'
-    )
+    context: Optional[dict[str, Any]] = None,
+) -> List[dict[str, Any]]:
+    """
+    Generate a list of candidate hypotheses / ideas for a topic.
+
+    There is intentionally NO deterministic fallback here: if this call fails,
+    the exception will propagate back to the calling agent.
+    """
     schema_hint = """
-{
-  "ideas": [
-    {
-      "title": "string",
-      "rationale": "string",
-      "mechanism": "string",
-      "novelty": "string",
-      "dependencies": "string",
-      "plan": ["string", "string"],
-      "resources": "string",
-      "metrics": [{"metric":"string","target":"string","timeframe":"string"}],
-      "risks": ["string","string"],
-      "mitigations": ["string","string"],
-      "expected_outcome": "string",
-      "confidence": 0.0,
-      "timeline_weeks": 0,
-      "cost_tshirt": "XS"
-    }
-  ]
-}
+    A JSON array of objects, each with:
+      - id: short identifier string (e.g. "H1")
+      - title: short, human-readable title
+      - description: multi-sentence description of the hypothesis
+      - rationale: explanation of why this might be true or worthwhile
+      - feasibility: short text on how feasible this is to test
+      - novelty: short text on novelty vs typical work
+      - potential_impact: description of scientific / societal impact
+      - risk_factors: list of strings for key risks or caveats
+    """
+
+    user_prompt = f"""
+Topic:
+{topic}
+
+Generate EXACTLY {n} diverse, non-trivial, testable hypotheses or research
+ideas about the topic above. They should:
+
+- be as specific and operationalizable as possible
+- cover multiple distinct mechanisms / interventions / perspectives
+- be plausible to investigate in practice
+
+Return ONLY JSON as described in the schema hint.
 """
-    data = await _call_llm_json(system_msg, user_msg, schema_hint, context=context)
-    ideas: list[dict[str, Any]] = []
-    for it in data.get('ideas', []):
-        if isinstance(it, dict) and it.get('title'):
-            ideas.append(it)
 
-    if ideas:
-        return ideas
-
-    # -------- Local fallback: deterministic top-10 ideas --------
-    titles = _seed_titles(topic, n)
-    local_ideas = [_local_idea(topic, t, i) for i, t in enumerate(titles)]
-    record_llm_call(
-        {
-            'type': 'brainstorm_fallback_local',
-            'model': 'offline-fallback',
-            'temperature': None,
-            'raw_response_text': json.dumps(local_ideas)[:5000],
-            'parsed_response': None,
-            'reasoning': 'LLM brainstorm empty; generated deterministic local ideas.',
-            'error': None,
-            'context': {**(context or {}), 'call_type': 'brainstorm_local'},
-        },
-        mirror_to=get_llm_audit_path(),
+    ideas = await _call_llm_json(
+        system_instructions=(
+            "You are an expert research scientist in a multi-agent system. "
+            "Your job is to propose high-quality hypotheses."
+        ),
+        user_prompt=user_prompt,
+        schema_hint=schema_hint,
+        purpose="reasoning",
+        temperature=0.6,
+        max_tokens=4096,
+        context=context,
     )
-    return local_ideas
+
+    if not isinstance(ideas, list):
+        raise RuntimeError(f"brainstorm_hypotheses expected list, got {type(ideas)!r}")
+    return ideas
 
 
-async def critique_hypothesis(
-    idea: dict[str, Any],
-    retrieved_contexts: list[str] | None = None,
-    context: dict[str, Any] | None = None,
+async def review_hypothesis(
+    hypothesis: dict[str, Any],
+    retrieved: Optional[List[dict[str, Any]]] = None,
+    context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    evidence_block = ''
-    if retrieved_contexts:
-        trimmed = [c.strip() for c in retrieved_contexts[:8]]
-        joined = '\n\n---\n'.join(trimmed)
-        evidence_block = '\n\n[EVIDENCE PACK]\n' + joined + '\n'
+    """
+    Peer-review style critique for a single hypothesis.
 
-    system_msg = (
-        'You are a technical review panel. Evaluate feasibility, payoff, clarity, '
-        'risk, dependencies, and realism of plan and metrics. Offer pointed improvements.'
-    )
-    user_msg = (
-        'Evaluate this idea in detail and propose improvements.\n\n'
-        f'IDEA JSON:\n{json.dumps(idea, ensure_ascii=False)}\n'
-        f'{evidence_block}\n'
-        'Return: strengths, weaknesses, feasibility_risks(2-4), '
-        'suggested_improvements(3-6), score(0..1).'
-    )
+    This function is explicitly used by ReviewAgent._review_single and is what
+    prevents the system from falling back to deterministic, hard-coded
+    heuristics when the LLM is available.
+    """
     schema_hint = """
-{
-  "strengths": "string",
-  "weaknesses": "string",
-  "feasibility_risks": ["string","string"],
-  "suggested_improvements": ["string","string","string"],
-  "score": 0.0
-}
-"""
-    data = await _call_llm_json(system_msg, user_msg, schema_hint, context=context)
-    return {
-        'strengths': data.get('strengths', ''),
-        'weaknesses': data.get('weaknesses', ''),
-        'feasibility_risks': data.get('feasibility_risks', []),
-        'suggested_improvements': data.get('suggested_improvements', []),
-        'score': float(data.get('score', 0.6)),
-    }
+    A JSON object with:
+      - strengths: list of strings
+      - weaknesses: list of strings
+      - feasibility_risks: list of strings
+      - suggested_improvements: list of strings
+      - risks: list of strings
+      - score: number in [0, 1]
+      - confidence: number in [0, 1]
+      - recommendation: one of
+          ["strong_accept","accept","weak_accept","borderline",
+           "weak_reject","reject"]
+      - notes: free-form string with any extra comments
+    """
 
+    title = hypothesis.get("title") or hypothesis.get("name") or f"Hypothesis {hypothesis.get('id')}"
+    desc = hypothesis.get("description") or hypothesis.get("text") or ""
 
-async def debate_and_choose(
-    i1_text: str,
-    i2_text: str,
-    context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    system_msg = (
-        'You are a portfolio allocator. Pick the better near-term bet considering '
-        'expected value (payoff*probability), time-to-insight, plan realism, and risk.'
-    )
-    user_msg = (
-        'Compare proposals and pick a single winner (1 or 2) with 2-4 sentences of reasoning.\n\n'
-        f'Proposal 1:\n{i1_text}\n\n'
-        f'Proposal 2:\n{i2_text}\n\n'
-    )
-    schema_hint = """
-{
-  "winner": 1,
-  "reasoning": "string"
-}
+    if retrieved:
+        ctx_block_lines = []
+        for i, doc in enumerate(retrieved[:5]):
+            text = str(doc.get("text") or "")
+            score = doc.get("score")
+            header = f"Doc {i+1}"
+            if score is not None:
+                header += f" (score={score})"
+            ctx_block_lines.append(f"{header}:\n{text}\n")
+        ctx_block = "\n".join(ctx_block_lines)
+    else:
+        ctx_block = "No external documents were retrieved for this hypothesis."
+
+    user_prompt = f"""
+You are a critical but fair scientific peer reviewer.
+
+Hypothesis JSON:
+{json.dumps(hypothesis, ensure_ascii=False, indent=2)}
+
+Retrieved context (may be noisy or incomplete):
+{ctx_block}
+
+Provide a detailed, calibrated critique and return it strictly as JSON according
+to the schema hint.
 """
-    data = await _call_llm_json(system_msg, user_msg, schema_hint, context=context)
-    raw_winner = data.get('winner', 1)
-    try:
-        winner_int = int(raw_winner)
-        if winner_int not in (1, 2):
-            winner_int = 1
-    except Exception:
-        winner_int = 1
-    return {'winner': winner_int, 'reasoning': data.get('reasoning', '')}
+
+    critique = await _call_llm_json(
+        system_instructions=(
+            "You are reviewing a single scientific hypothesis. Be concrete, "
+            "specific, and well-calibrated in your judgments."
+        ),
+        user_prompt=user_prompt,
+        schema_hint=schema_hint,
+        purpose="reasoning",
+        temperature=0.4,
+        max_tokens=3072,
+        context=context,
+    )
+
+    if not isinstance(critique, dict):
+        raise RuntimeError(f"review_hypothesis expected dict, got {type(critique)!r}")
+
+    return critique
 
 
 async def evolve_hypothesis(
     idea: dict[str, Any],
     critiques: dict[str, Any],
-    context: dict[str, Any] | None = None,
+    context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    system_msg = (
-        'You are a refiner. Incorporate critiques to make the plan more specific, '
-        'reduce risk, clarify metrics/targets, and improve expected value.'
-    )
-    user_msg = (
-        'Refine the idea with these critiques. Keep structure and add specificity where missing.\n\n'
-        f'IDEA JSON:\n{json.dumps(idea, ensure_ascii=False)}\n\n'
-        f'CRITIQUES JSON:\n{json.dumps(critiques, ensure_ascii=False)}\n\n'
-        'Return the full improved IDEA JSON (same keys as input).'
-    )
+    """
+    Improve / refine an existing hypothesis using reviews.
+    """
     schema_hint = """
-{
-  "title": "string",
-  "rationale": "string",
-  "mechanism": "string",
-  "novelty": "string",
-  "dependencies": "string",
-  "plan": ["string","string"],
-  "resources": "string",
-  "metrics": [{"metric":"string","target":"string","timeframe":"string"}],
-  "risks": ["string","string"],
-  "mitigations": ["string","string"],
-  "expected_outcome": "string",
-  "confidence": 0.0,
-  "timeline_weeks": 0,
-  "cost_tshirt": "XS"
-}
+    A JSON object describing a refined hypothesis with fields:
+      - id
+      - title
+      - description
+      - rationale
+      - feasibility
+      - novelty
+      - potential_impact
+      - risk_factors (list of strings)
+    """
+
+    user_prompt = f"""
+You are an AI co-scientist. Refine this hypothesis using the critiques.
+
+Original idea JSON:
+{json.dumps(idea, ensure_ascii=False, indent=2)}
+
+Aggregated critiques JSON:
+{json.dumps(critiques, ensure_ascii=False, indent=2)}
+
+Make the refined version more precise, testable, and decision-relevant.
+Return ONLY JSON following the schema hint.
 """
-    data = await _call_llm_json(
-        system_instructions=system_msg,
-        user_prompt=user_msg,
+
+    refined = await _call_llm_json(
+        system_instructions="Refine hypotheses given critiques while preserving the core idea.",
+        user_prompt=user_prompt,
         schema_hint=schema_hint,
+        purpose="reasoning",
+        temperature=0.5,
+        max_tokens=3072,
         context=context,
     )
 
-    refined = {
-        'title': data.get('title', idea.get('title', '')),
-        'rationale': data.get('rationale', idea.get('rationale', '')),
-        'mechanism': data.get('mechanism', idea.get('mechanism', '')),
-        'novelty': data.get('novelty', idea.get('novelty', '')),
-        'dependencies': data.get('dependencies', idea.get('dependencies', '')),
-        'plan': data.get('plan', idea.get('plan', [])),
-        'resources': data.get('resources', idea.get('resources', '')),
-        'metrics': data.get('metrics', idea.get('metrics', [])),
-        'risks': data.get('risks', idea.get('risks', [])),
-        'mitigations': data.get('mitigations', idea.get('mitigations', [])),
-        'expected_outcome': data.get('expected_outcome', idea.get('expected_outcome', '')),
-        'confidence': float(data.get('confidence', idea.get('confidence', 0.6))),
-        'timeline_weeks': int(data.get('timeline_weeks', idea.get('timeline_weeks', 6))),
-        'cost_tshirt': data.get('cost_tshirt', idea.get('cost_tshirt', 'M')),
-    }
+    if not isinstance(refined, dict):
+        raise RuntimeError(f"evolve_hypothesis expected dict, got {type(refined)!r}")
     return refined
 
 
 async def summarize_background(
     topic: str,
-    context: dict[str, Any] | None = None,
+    context: Optional[dict[str, Any]] = None,
 ) -> str:
-    system_msg = (
-        'Write a compact background summary for experts: current approaches, '
-        'main challenges, open questions, and recent trends. Avoid fluff.'
-    )
-    user_msg = f'Topic: {topic}\nSummarize current understanding, approaches, limitations, and open questions.'
-
-    writing_model = get_model('writing')
-
-    text = await _call_openai_responses(
-        model=writing_model,
-        system_instructions=system_msg,
-        user_input=user_msg,
-        allow_temperature=True,
-        temperature_value=0.4,
-        context={
-            **(context or {}),
-            'call_type': 'background_summary',
-            'topic': topic,
-        },
-    )
-    return text or f'[OFFLINE SUMMARY for {topic}]'
-
-
-async def synthesize_meta_report(
-    leaderboard: list[tuple[str, float, dict[str, Any]]],
-    context: dict[str, Any] | None = None,
-) -> str:
-    """Try LLM meta report; if empty, synthesize locally (and log)."""
-    system_msg = (
-        'Synthesize portfolio: group themes, identify cross-cutting risks, '
-        'shared dependencies, opportunities to share data/tools, and a short prioritized roadmap.'
-    )
-
-    slim = []
-    for hid, elo, idea in leaderboard:
-        slim.append(
-            {
-                'id': hid,
-                'elo': elo,
-                'title': idea.get('title', ''),
-                'confidence': idea.get('confidence', 0.6),
-                'timeline_weeks': idea.get('timeline_weeks', 6),
-                'cost_tshirt': idea.get('cost_tshirt', 'M'),
-                'key_metrics': idea.get('metrics', [])[:2],
-            }
-        )
-
-    user_msg = (
-        'Given this portfolio, write:\n'
-        '1) Themes across ideas\n'
-        '2) Shared risks/mitigations\n'
-        '3) Shared dependencies and data/tools that could be centralized\n'
-        '4) A rough prioritized roadmap across the top 10 ideas\n\n'
-        f'PORTFOLIO SLIM JSON:\n{json.dumps(slim, ensure_ascii=False)}'
-    )
-
-    reasoning_model = get_model('reasoning')
-
-    text = await _call_openai_responses(
-        model=reasoning_model,
-        system_instructions=system_msg,
-        user_input=user_msg,
-        allow_temperature=False,
-        context={
-            **(context or {}),
-            'call_type': 'meta_report',
-        },
-    )
-    if text:
-        return text
-
-    local = _local_meta(leaderboard)
-    record_llm_call(
-        {
-            'type': 'meta_report_fallback_local',
-            'model': 'offline-fallback',
-            'temperature': None,
-            'raw_response_text': local[:5000],
-            'parsed_response': None,
-            'reasoning': 'LLM meta synthesis empty; built local synthesis.',
-            'error': None,
-            'context': {**(context or {}), 'call_type': 'meta_report_local'},
-        },
-        mirror_to=get_llm_audit_path(),
-    )
-    return local
-
-
-# --------- Local report construction fallback (no LLM needed) -----------------
-
-
-def build_detailed_report_locally(
-    research_goal: str,
-    ideas_ranked: list[tuple[str, float, dict[str, Any]]],
-    meta_summary: str,
-) -> str:
-    out = []
-    out.append(f'# Goal\n{research_goal}\n')
-    out.append('# Top 10 Ideas\n')
-    if not ideas_ranked:
-        out.append('(no ideas generated)')
-    for rank, (hid, elo, idea) in enumerate(ideas_ranked, start=1):
-        out.append(f'## {rank}. {idea.get("title", "(untitled)")}  \nID: {hid} · ELO {elo:.1f}')
-        out.append(f'**Rationale:** {idea.get("rationale", "")}')
-        out.append(f'**Mechanism:** {idea.get("mechanism", "")}')
-        out.append(f'**Novelty:** {idea.get("novelty", "")}')
-        out.append(f'**Dependencies:** {idea.get("dependencies", "")}')
-        plan = idea.get('plan', [])
-        if plan:
-            out.append('**Plan:**')
-            for step in plan:
-                out.append(f'- {step}')
-        else:
-            out.append('**Plan:**\n- (none)')
-        out.append(f'**Resources:** {idea.get("resources", "")}')
-        out.append('**Metrics:**\n' + _fmt_metrics(idea.get('metrics', [])))
-        out.append(_fmt_list('Risks', idea.get('risks', [])))
-        out.append(_fmt_list('Mitigations', idea.get('mitigations', [])))
-        out.append(f'**Expected outcome:** {idea.get("expected_outcome", "")}')
-        out.append(
-            f'**Confidence:** {idea.get("confidence", 0.6)} · '
-            f'**Timeline (weeks):** {idea.get("timeline_weeks", 6)} · '
-            f'**Cost (t-shirt):** {idea.get("cost_tshirt", "M")}',
-        )
-        out.append('')  # spacer
-
-    out.append('# Portfolio Synthesis\n')
-    out.append(meta_summary or '(none)')
-
-    return '\n'.join(out)
-
-
-async def draft_final_report(
-    research_goal: str,
-    ideas_ranked: list[tuple[str, float, dict[str, Any]]],
-    meta_summary: str,
-    context: dict[str, Any] | None = None,
-) -> str:
-    """Try LLM-written report; if empty, build a rich local report.
-    Both paths are logged: the failed LLM call is in llm_calls.jsonl.
     """
-    system_msg = (
-        'Write a technical brief preserving concrete plans and metrics.'
-        ' Include: (a) goal, (b) top 10 ideas with detailed plan/outcomes/confidence,'
-        ' (c) portfolio synthesis. Avoid generic buzzwords.'
+    Background literature-style summary for a topic.
+
+    Used by LiteratureAgent. Returns plain text (no markdown).
+    """
+    user_prompt = f"""
+Topic:
+{topic}
+
+Write a compact but information-dense background summary (around 800–1200 words)
+as if for a scientifically literate collaborator. Cover:
+
+- main sub-areas or facets of the topic
+- common methodologies and their limitations
+- known sources of bias, toxicity, or failure modes if relevant
+- key open questions or promising directions
+
+Plain text only, no markdown headings or bullet syntax.
+"""
+
+    summary = await _chat(
+        purpose="reasoning",
+        system_prompt="You write clear, neutral, and precise scientific background summaries.",
+        user_prompt=user_prompt,
+        temperature=0.4,
+        max_tokens=4096,
+        context=context,
     )
+    return summary
 
-    ideas_block = []
-    for rank, (hid, elo, idea) in enumerate(ideas_ranked, start=1):
-        ideas_block.append(
-            {
-                'rank': rank,
-                'id': hid,
-                'elo': round(elo, 1),
-                **idea,
-            }
-        )
 
-    user_msg = (
-        f'# Goal\n{research_goal}\n\n'
-        '# Top 10 Ideas (preserve details; do NOT over-summarize)\n'
-        f'{json.dumps(ideas_block, ensure_ascii=False)}\n\n'
-        '# Portfolio Synthesis\n'
-        f'{meta_summary}\n\n'
-        'Now write the final report.'
+async def agent_self_commentary(
+    agent_name: str,
+    state_snapshot: dict[str, Any],
+    context: Optional[dict[str, Any]] = None,
+) -> str:
+    """
+    Short reflective note used by SupervisorAgent for logging / introspection.
+    """
+    compact_state = json.dumps(state_snapshot, ensure_ascii=False)[:2000]
+
+    user_prompt = f"""
+You are {agent_name}, an agent in a multi-agent co-scientist pipeline.
+
+Here is a JSON snapshot of your current state:
+{compact_state}
+
+Write a very short self-commentary (<= 200 words) about:
+- what you are about to do next
+- what you should pay particular attention to
+- any salient risks or failure modes you want to flag
+
+Plain text only.
+"""
+
+    commentary = await _chat(
+        purpose="reasoning",
+        system_prompt="You are a self-reflective AI component describing its own next steps.",
+        user_prompt=user_prompt,
+        temperature=0.3,
+        max_tokens=512,
+        context=context,
     )
-
-    writing_model = get_model('writing')
-
-    text = await _call_openai_responses(
-        model=writing_model,
-        system_instructions=system_msg,
-        user_input=user_msg,
-        allow_temperature=True,
-        temperature_value=0.4,
-        context={
-            **(context or {}),
-            'call_type': 'final_report',
-            'ideas_count': len(ideas_ranked),
-        },
-    )
-
-    if text:
-        return text
-
-    # Local fallback (no LLM)
-    local = build_detailed_report_locally(research_goal, ideas_ranked, meta_summary)
-    record_llm_call(
-        {
-            'type': 'final_report_fallback_local',
-            'model': 'offline-fallback',
-            'temperature': None,
-            'raw_response_text': local[:5000],
-            'parsed_response': None,
-            'reasoning': 'LLM returned empty; constructed local report.',
-            'error': None,
-            'context': {
-                **(context or {}),
-                'call_type': 'final_report_local',
-                'ideas_count': len(ideas_ranked),
-            },
-        },
-        mirror_to=get_llm_audit_path(),
-    )
-    return local
+    return commentary

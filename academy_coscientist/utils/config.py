@@ -32,8 +32,8 @@ def get_model(role: str, default: str | None = None) -> str:
         return str(models[role])
     # sensible fallbacks if not configured
     defaults = {
-        'reasoning': 'gpt-5-reasoning',
-        'writing': 'gpt-5o-mini',
+        'reasoning': "o4-mini",
+        'writing': "gpt-4o",
         'embedding': 'text-embedding-3-small',
     }
     return default or defaults.get(role, 'gpt-5o-mini')

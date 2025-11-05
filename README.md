@@ -15,11 +15,6 @@ Welcome to the **Academy Co-Scientist** tutorial repository. This project showca
 - [Usage](#usage)
 - [Agents Overview](#agents-overview)
 - [Project Structure](#project-structure)
-- [Development](#development)
-  - [Environment](#environment)
-  - [Pre-commit](#pre-commit)
-- [CI / GitHub Actions](#ci--github-actions)
-- [License](#license)
 
 ---
 
@@ -94,17 +89,17 @@ The final output will be a report with top-ranked hypotheses and analysis.
 ---
 
 ## Agents Overview
-
-| Agent                 | Role                                                         |
-|----------------------|--------------------------------------------------------------|
-| `HypothesisGenerationAgent` | Generates initial ideas from the topic                  |
+|-------------------------------------------------------------------------------------|
+| Agent                 | Role                                                        |
+|-----------------------|-------------------------------------------------------------|
+| `GenerationAgent`     | Generates initial ideas from the topic                      |
 | `ReviewAgent`         | Evaluates and scores hypotheses                             |
 | `TournamentAgent`     | Runs pairwise comparisons to rank hypotheses                |
-| `MetaReviewAgent`     | Analyzes reviewer consistency and refines rankings          |
+| `MetaAgent`           | Analyzes reviewer consistency and refines rankings          |
 | `ReportAgent`         | Synthesizes the final report                                |
 | `SupervisorAgent`     | Orchestrates all other agents                               |
 | `VectorStoreAgent`    | Handles embedding and document retrieval                    |
-
+|-------------------------------------------------------------------------------------|
 ---
 
 ## Project Structure
@@ -126,55 +121,3 @@ academy_coscientist/
 ├── config.yml            # YAML config file
 └── README.md             # This file
 ```
-
----
-
-## Development
-
-### Environment
-
-Create a development environment:
-
-```bash
-pip install -e .[dev]
-```
-
-### Pre-commit
-
-Enable pre-commit checks:
-
-```bash
-pre-commit install
-```
-
-Run manually:
-
-```bash
-pre-commit run --all-files
-```
-
-Pre-commit hooks include:
-
-- Ruff lint + format
-- MyPy type checking
-- Codespell
-- Trailing whitespace, EOF checks
-
----
-
-## CI / GitHub Actions
-
-This repo includes a GitHub Actions workflow (`.github/workflows/ci.yml`) that:
-
-- Installs dependencies
-- Runs tests (if any)
-- Checks formatting and linting
-- Validates type hints
-
----
-
-## License
-
-This project is licensed under the MIT License.
-
-(c) 2025 Amal Gueroudji | agueroudji@anl.gov

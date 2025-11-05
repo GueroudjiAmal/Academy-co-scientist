@@ -2,15 +2,13 @@ launch:
   topic: ""
   hypotheses_count: 2
   reviewer_top_k: 1
-  # Optional: override paths here if you want different locations
-  # docs_dir is usually configured under paths, but you can keep them together if you prefer
 
 models:
-  reasoning: "o4-mini" # gpt-5-reasoning
-  writing: "gpt-4o" #gpt-5o-mini
-  embedding: text-embedding-3-small
-  # To run fully local embeddings:
-  # embedding: local-all-MiniLM-L6-v2
+  reasoning: "o4-mini"          # instead of gpt-5-reasoning
+  writing: "gpt-4o"             # instead of gpt-5o-mini
+  embedding: "text-embedding-3-small"
+  # To run fully local embeddings, you could use:
+  # embedding: "local-all-MiniLM-L6-v2"
 
 paths:
   docs_dir: "research_papers"

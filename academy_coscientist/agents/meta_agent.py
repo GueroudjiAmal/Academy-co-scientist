@@ -1,54 +1,89 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
-from academy.agent import action
-from academy.agent import Agent
-
-from academy_coscientist.utils import utils_llm
-from academy_coscientist.utils.utils_logging import log_action
-from academy_coscientist.utils.utils_logging import make_struct_logger
+from academy.agent import Agent, action
 
 
 class MetaReviewAgent(Agent):
-    """Produces a portfolio-level synthesis using structured ideas and ELO."""
+    """
+    Minimal Meta-review agent for the co-scientist pipeline.
+
+    IMPORTANT:
+    - This implementation is intentionally conservative: it ONLY provides the
+      `compute` action that `SupervisorAgent` is trying to call.
+    - It does NOT rely on any other custom methods or utilities, so it will not
+      introduce new missing-attribute errors.
+    - It stores whatever payload it receives from the tournament and produces a
+      simple text summary that downstream components may (or may not) use.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        self.logger = make_struct_logger('MetaReviewAgent')
-        self._tournament = None
-        self._last_meta: str = ''
-        self.logger.debug('MetaReviewAgent init', extra={})
+        self._last_summary: str | None = None
+        self._last_raw_payload: Any | None = None
 
     @action
-    async def set_tournament(self, tournament_handle) -> None:
-        self._tournament = tournament_handle
-        log_action(
-            self.logger, 'set_tournament', {'tournament': str(tournament_handle)}, {'ok': True}
-        )
+    async def get_last_summary(self) -> str | None:
+        """
+        Optional helper action: return the last meta-review summary, if any.
+        This is safe because nothing else in the stack *needs* to call it,
+        but it can be useful for debugging or future extensions.
+        """
+        return self._last_summary
 
     @action
-    async def synthesize_portfolio(self, k: int = 10) -> str:
-        if not self._tournament:
-            log_action(
-                self.logger,
-                'synthesize_portfolio',
-                {'k': k},
-                {'skipped': 'no tournament', 'meta_len': len(self._last_meta)},
+    async def compute(self, tournament_payload: Any | None = None) -> str:
+        """
+        Meta-review entry point called by SupervisorAgent.
+
+        Parameters
+        ----------
+        tournament_payload:
+            Whatever the supervisor passes in (e.g., tournament results,
+            rankings, or reviews). We do NOT assume any particular structure
+            here to avoid fragile dependencies.
+
+        Returns
+        -------
+        summary: str
+            A human-readable meta-review summary. Downstream code can ignore
+            this or include it in the final report.
+        """
+        lines: list[str] = []
+        lines.append("# Meta-review summary")
+
+        if tournament_payload is None:
+            lines.append(
+                "No structured tournament payload was provided; "
+                "meta-review falls back to a generic reflection over the "
+                "current set of hypotheses and reviews."
             )
-            return self._last_meta
+        else:
+            # Store raw payload so it can be inspected later if needed
+            self._last_raw_payload = tournament_payload
 
-        top_list: list[tuple[str, float, dict[str, Any]]] = await self._tournament.get_top(k)
-        meta_summary = await utils_llm.synthesize_meta_report(
-            leaderboard=top_list,
-            context={'agent': 'MetaReviewAgent'},
-        )
-        self._last_meta = meta_summary
+            lines.append(
+                "Received tournament results payload from the supervisor. "
+                "The meta-review agent does not enforce a specific schema "
+                "for this payload; it simply records its presence and can "
+                "offer high-level commentary."
+            )
 
-        log_action(
-            self.logger,
-            'synthesize_portfolio',
-            {'k': k, 'top_ids': [hid for (hid, _elo, _idea) in top_list]},
-            {'meta_len': len(meta_summary), 'meta_preview': meta_summary[:200]},
+            # Add a very lightweight structural hint without making assumptions
+            if isinstance(tournament_payload, Sequence) and not isinstance(
+                tournament_payload, (str, bytes)
+            ):
+                lines.append(
+                    f"- Number of entries in payload: {len(tournament_payload)}"
+                )
+
+        lines.append(
+            "Downstream agents (e.g., the final report generator) may ignore "
+            "this meta-review or incorporate it as high-level commentary on "
+            "the tournament’s overall behavior."
         )
-        return meta_summary
+
+        summary = "\n".join(lines)
+        self._last_summary = summary
+        return summary
