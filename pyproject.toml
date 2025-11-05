@@ -1,0 +1,113 @@
+[build-system]
+requires = ["setuptools>=64.0", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "academy-coscientist"
+version = "0.1.0"
+authors = [{ name = "Amal Gueroudji", email = "agueroudji@anl.gov" }]
+maintainers = [{ name = "Amal Gueroudji", email = "agueroudji@anl.gov" }]
+description = "Materials for academy co-scientist"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+
+# Runtime deps (keep minimal but sufficient for the pipeline)
+dependencies = [
+  "academy-py>=0.3.0",                   # provides 'academy' module in most builds
+  "pyyaml>=6.0.1",
+  "openai>=1.40.0",
+  "pypdf>=4.0.0",                        # <-- replace pypdf2 with pypdf (fixes import)
+  "faiss-cpu>=1.8.0.post1",
+  "sentence-transformers>=3.0.1",
+  "tqdm>=4.66.4",
+  "rich>=13.7.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "black>=24.8.0",
+  "mypy>=1.11.1",
+  "pre-commit>=3.7.1",
+  "ruff>=0.6.7",
+  "pytest>=8.3.2",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+check_untyped_defs = true
+no_implicit_optional = true
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+asyncio_mode = "auto"
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.format]
+indent-style = "space"
+line-ending = "lf"
+quote-style = "single"
+
+[tool.ruff.lint]
+select = [
+  "F",     # pyflakes
+  "E",     # pycodestyle
+  "C90",   # mccabe
+  "I",     # isort
+  "N",     # pep8-naming
+  "D",     # pydocstyle
+  "UP",    # pyupgrade
+  "YTT",   # flake8-2020
+  "B",     # bugbear
+  "A",     # builtins
+  "COM",   # commas
+  "C4",    # comprehensions
+  "ISC",   # implicit-str-concat
+  "PT",    # pytest-style
+  "Q",     # quotes
+  "T10",   # debugger
+  "SIM",   # simplify
+  "PL",    # pylint
+  "RUF",   # ruff-specific
+]
+extend-ignore = [
+  "A005",   # allow builtin shadowing
+  "D100", "D104", "D105", "D107",  # relax docstring demands
+  "SIM117", # allow nested with
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["academy_coscientist"]
+order-by-type = false
+force-single-line = true
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+multiline-quotes = "double"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.setuptools.packages.find]
+include = ["academy_coscientist"]
+namespaces = false

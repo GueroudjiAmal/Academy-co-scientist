@@ -1,0 +1,19 @@
+launch:
+  topic: ""
+  hypotheses_count: 2
+  reviewer_top_k: 1
+  # Optional: override paths here if you want different locations
+  # docs_dir is usually configured under paths, but you can keep them together if you prefer
+
+models:
+  reasoning: "o4-mini" # gpt-5-reasoning
+  writing: "gpt-4o" #gpt-5o-mini
+  embedding: text-embedding-3-small
+  # To run fully local embeddings:
+  # embedding: local-all-MiniLM-L6-v2
+
+paths:
+  docs_dir: "research_papers"
+  embeddings_dir: "embeddings"
+  abstracts_cache_dir: "embeddings/abstracts"
+  # logs_dir is created automatically per-run via utils_logging.init_run_context()
