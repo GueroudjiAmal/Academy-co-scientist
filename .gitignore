@@ -209,3 +209,5 @@ __marimo__/
 # Logs
 logs/
 embeddings/
+_reseach_papers
+_.pre-commit-config.yaml
