@@ -76,6 +76,7 @@ launch:
 Run the pipeline using:
 
 ```bash
+export OPENAI_API_KEY="sk..."
 python -m academy_coscientist.launcher --config academy_coscientist/config.yaml --topic "Reliable AI" --hypotheses-count 2
 ```
 
