@@ -1,0 +1,31 @@
+Agentic artificial intelligence systems can reason, plan, and execute
+complex workflows, which can speed up scientific discovery. Their
+non-deterministic behavior, however, makes reliability a core chal-
+lenge in domains that require safety, precision, and reproducibility.
+Moreover, their autonomy can cause security threats if their per-
+missions are not correctly set up. This paper proposes a practical
+set of best-practice guardrails that aim to guarantee reliable Agen-
+tic workflows, both from the science and cybersecurity point of
+view. We organize the principles into safety, reliability, and security
+sets, from intent to actuation: intent normalization, schema en-
+forcement, and role-scoped tool access; uncertainty budgeting with
+propagation and computed thresholds; provenance capture with
+reproducible configurations, caching, and rollback; and verification
+loops that include simulation cross-checks, model recalibration,
+and human-in-the-loop escalation. We ground the guidance in a
+case study, an Agentic chemistry framework for molecular property
+prediction and automation that integrates knowledge-driven plan-
+ning with high-fidelity simulation in a closed loop. We show how
+the guardrails reduce common failure modes, improve end-to-end
+reliability, and yield scientifically valid, reproducible outcomes. The
+result is a concise set of patterns that practitioners can adopt to
+build trustworthy autonomy in scientific computing.
+CCS Concepts
+•Computing methodologies →Distributed computing method-
+ologies;Parallel computing methodologies; Artificial intelligence.
+Keywords
+Reliable Agentic AI, Agentic Workflows, Computational Chemistry
+ACM Reference Format:
+. 2026. Agentic Workflow Design Principles for Reliable Science. InProceed-
+ings of The 41st ACM/SIGAPP Symposium on Applied Computing (SAC’26).
+ACM, New York, NY, USA, 8 pages. https://doi.org/XXXXXXX.XXXXXXX

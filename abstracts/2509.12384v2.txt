@@ -1,0 +1,17 @@
+Vector databases have rapidly grown in popularity, enabling effi-
+cient similarity search over data such as text, images, and video.
+They now play a central role in modern AI workflows, aiding large
+language models by grounding model outputs in external literature
+through retrieval-augmented generation. Despite their importance,
+little is known about the performance characteristics of vector
+databases in high-performance computing (HPC) systems that drive
+large-scale science. This work presents an empirical study of dis-
+tributed vector database performance on the Polaris supercomputer
+in the Argonne Leadership Computing Facility. We construct a
+realistic biological-text workload from BV-BRC and generate em-
+beddings from the peS2o corpus using Qwen3-Embedding-4B. We
+select Qdrant to evaluate insertion, index construction, and query
+latency with up to 32 workers. Informed by practical lessons from
+our experience, this work takes a first step toward characterizing
+vector database performance on HPC platforms to guide future
+research and optimization. 1

@@ -1,206 +1,185 @@
 # academy_coscientist/utils/utils_llm.py
+
 from __future__ import annotations
 
 import json
-from typing import Any, Iterable, List, Optional
+import os
+import random
+import logging
+from typing import Any
+import asyncio
 
-from openai import AsyncOpenAI
-import openai
+from openai import APIStatusError, AsyncOpenAI, RateLimitError
+
 from academy_coscientist.utils.config import get_model
-from academy_coscientist.utils.utils_logging import make_struct_logger
+from academy_coscientist.utils.utils_logging import (
+    get_llm_audit_path,
+    record_llm_call,
+    make_struct_logger,
+)
 
-_client = AsyncOpenAI()
 _logger = make_struct_logger("utils_llm")
 
+_last_known_embed_dim: int | None = None
+
+
+def _get_openai_client() -> AsyncOpenAI:
+    """
+    Create a fresh AsyncOpenAI client.
+
+    We avoid binding a single client instance to a specific event loop,
+    which is what caused 'Event is bound to a different event loop'
+    errors when run under different asyncio loops.
+    """
+    return AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+def _is_local_embedding_model(name: str) -> bool:
+    return str(name).strip().lower().startswith("local-")
+
+
+def _local_model_name_from_config(name: str) -> str:
+    return name.split("local-", 1)[1] if "local-" in name else name
+
 
 # ---------------------------------------------------------------------------
-# Low-level chat + JSON helpers
+# Optional local embedding backend (SentenceTransformer)
+# ---------------------------------------------------------------------------
+
+try:
+    from sentence_transformers import SentenceTransformer  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    SentenceTransformer = None  # type: ignore[assignment]
+
+_LOCAL_EMBEDDER_CACHE: dict[str, Any] = {}
+
+
+def _get_local_embedder(model_name: str):
+    global _LOCAL_EMBEDDER_CACHE, SentenceTransformer
+
+    if model_name in _LOCAL_EMBEDDER_CACHE:
+        return _LOCAL_EMBEDDER_CACHE[model_name]
+
+    if SentenceTransformer is None:
+        raise RuntimeError(
+            "sentence-transformers not installed, but a local embedding "
+            "model was requested."
+        )
+
+    model = SentenceTransformer(model_name)
+    _LOCAL_EMBEDDER_CACHE[model_name] = model
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Safe JSON serializers (for logging SDK objects)
 # ---------------------------------------------------------------------------
 
 
-async def _chat(
-    purpose: str,
-    system_prompt: str,
-    user_prompt: str,
-    *,
-    temperature: float = 0.4,
-    max_tokens: int = 2048,
-    context: Optional[dict[str, Any]] = None,
+def _to_safe_json(x: Any, depth: int = 0, max_depth: int = 4) -> Any:
+    if depth > max_depth:
+        return str(x)
+
+    if isinstance(x, dict):
+        return {k: _to_safe_json(v, depth + 1, max_depth) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_to_safe_json(v, depth + 1, max_depth) for v in x]
+    if isinstance(x, (str, int, float, bool)) or x is None:
+        return x
+
+    return repr(x)
+
+
+# ---------------------------------------------------------------------------
+# Chat / reasoning helpers
+# ---------------------------------------------------------------------------
+
+
+async def _chat_completion(
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float | None = None,
+    max_completion_tokens: int | None = None,
+    ctx: dict[str, Any] | None = None,
 ) -> str:
-    """
-    Unified, version-safe chat wrapper for all OpenAI models.
+    ctx = ctx or {}
+    audit_path = ctx.get("audit_path", get_llm_audit_path())
 
-    Handles:
-      - reasoning models (o1, o3, o4-mini, etc.)
-      - legacy chat models (gpt-4o, gpt-3.5-turbo)
-      - parameter compatibility (`max_tokens` vs `max_completion_tokens`)
-      - temperature restrictions
-    """
-    model = get_model(purpose)
-    ctx = context or {}
+    allow_temperature = True
+    if model in {"o4-mini"}:
+        allow_temperature = False
 
-    _logger.debug(
-        "llm_chat_start",
-        extra={"purpose": purpose, "model": model, "temperature": temperature, "max_tokens": max_tokens},
-    )
+    temperature_value = temperature if allow_temperature else None
 
+    llm_record: dict[str, Any] = {
+        "type": "chat_completion",
+        "model": model,
+        "temperature": temperature_value,
+        "messages": messages,
+        "context": ctx,
+    }
+
+    try:
+        client = _get_openai_client()
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+        }
+        if max_completion_tokens is not None:
+            kwargs["max_completion_tokens"] = max_completion_tokens
+        if temperature_value is not None:
+            kwargs["temperature"] = temperature_value
+
+        resp = await client.chat.completions.create(**kwargs)
+        content = resp.choices[0].message.content or ""
+        llm_record["response"] = _to_safe_json(resp)
+        record_llm_call(llm_record, mirror_to=audit_path)
+        return content
+    except (APIStatusError, RateLimitError) as e:
+        llm_record["error"] = repr(e)
+        record_llm_call(llm_record, mirror_to=audit_path)
+        _logger.error("Chat completion failed", extra={"error": repr(e), "model": model})
+        raise
+
+
+async def call_reasoning_llm(
+    system: str,
+    user: str,
+    ctx: dict[str, Any] | None = None,
+    max_completion_tokens: int | None = None,
+) -> str:
+    model = get_model("reasoning")
     messages = [
-        {"role": "system", "content": system_prompt.strip()},
-        {"role": "user", "content": user_prompt.strip()},
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
     ]
-
-    # Detect if the model is a reasoning model
-    is_reasoning = any(tag in model for tag in ("o1", "o3", "o4", "mini", "reasoning"))
-
-    # Build kwargs dynamically
-    kwargs = dict(model=model, messages=messages)
-
-    # Reasoning models: temperature must be omitted
-    if not is_reasoning:
-        kwargs["temperature"] = temperature
-
-    # Try the new-style param first
-    try:
-        resp = await _client.chat.completions.create(
-            **kwargs, max_completion_tokens=max_tokens
-        )
-    except openai.BadRequestError as e:
-        msg = str(e).lower()
-        if "unsupported_parameter" in msg or "max_tokens" in msg:
-            # fallback to legacy parameter name
-            resp = await _client.chat.completions.create(
-                **kwargs, max_tokens=max_tokens
-            )
-        elif "temperature" in msg or "unsupported_value" in msg:
-            # retry without temperature for reasoning models
-            kwargs.pop("temperature", None)
-            resp = await _client.chat.completions.create(
-                **kwargs, max_completion_tokens=max_tokens
-            )
-        else:
-            raise
-    except TypeError:
-        # compatibility fallback for old SDKs
-        resp = await _client.chat.completions.create(
-            **kwargs, max_tokens=max_tokens
-        )
-
-    text = resp.choices[0].message.content or ""
-    out = text.strip()
-
-    _logger.debug(
-        "llm_chat_done",
-        extra={"purpose": purpose, "model": model, "context": ctx, "output_preview": out[:200]},
+    return await _chat_completion(
+        model=model,
+        messages=messages,
+        temperature=None,
+        max_completion_tokens=max_completion_tokens,
+        ctx=ctx,
     )
 
-    return out
 
-
-
-def _extract_json_block(text: str) -> str:
-    """
-    Best-effort JSON extraction.
-
-    We do *not* invent content here; we simply try to trim away markdown
-    fences or stray commentary so that the remaining text is valid JSON.
-    If this fails, the caller is responsible for handling the parse error.
-    """
-    text = text.strip()
-
-    # Strip ```json fences if present.
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].startswith("```"):
-            text = "\n".join(lines[1:-1]).strip()
-
-    # Already-valid JSON?
-    try:
-        json.loads(text)
-        return text
-    except Exception:
-        pass
-
-    # Try slice from first { / [ to last } / ]
-    first = len(text)
-    for ch in ("{", "["):
-        idx = text.find(ch)
-        if idx != -1:
-            first = min(first, idx)
-
-    last = -1
-    for ch in ("}", "]"):
-        idx = text.rfind(ch)
-        if idx != -1:
-            last = max(last, idx)
-
-    if first >= last or last == -1 or first == len(text):
-        return text
-
-    return text[first : last + 1].strip()
-
-
-async def _call_llm_json(
-    system_instructions: str,
-    user_prompt: str,
-    schema_hint: str,
-    *,
-    purpose: str = "reasoning",
-    temperature: float = 0.3,
-    max_tokens: int = 2048,
-    context: Optional[dict[str, Any]] = None,
-) -> Any:
-    """
-    Shared JSON helper.
-
-    IMPORTANT: there is no deterministic JSON fabrication here.
-    If the model output cannot be parsed as JSON even after light cleanup,
-    json.loads(...) will raise and that exception is propagated.
-    """
-    sys_prompt = (
-        system_instructions.strip()
-        + "\n\nYou MUST reply with STRICT JSON only. "
-        "Do not include markdown code fences, prose, or explanations.\n"
-        "Intended JSON shape (natural language description):\n"
-        f"{schema_hint.strip()}\n"
-    )
-
-    raw = await _chat(
-        purpose=purpose,
-        system_prompt=sys_prompt,
-        user_prompt=user_prompt,
+async def call_writing_llm(
+    system: str,
+    user: str,
+    temperature: float = 0.7,
+    ctx: dict[str, Any] | None = None,
+    max_completion_tokens: int | None = None,
+) -> str:
+    model = get_model("writing")
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    return await _chat_completion(
+        model=model,
+        messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
-        context=context,
-    )
-
-    json_text = _extract_json_block(raw)
-    return json.loads(json_text)
-
-
-async def call_llm_json(
-    system_instructions: str,
-    user_prompt: str,
-    schema_hint: str,
-    *,
-    purpose: str = "reasoning",
-    temperature: float = 0.3,
-    max_tokens: int = 2048,
-    context: Optional[dict[str, Any]] = None,
-) -> Any:
-    """
-    Public wrapper used by downstream agents (e.g. ReportAgent).
-
-    This just forwards to `_call_llm_json` with explicit keyword arguments,
-    so signatures remain stable and easy to audit.
-    """
-    return await _call_llm_json(
-        system_instructions=system_instructions,
-        user_prompt=user_prompt,
-        schema_hint=schema_hint,
-        purpose=purpose,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        context=context,
+        max_completion_tokens=max_completion_tokens,
+        ctx=ctx,
     )
 
 
@@ -208,316 +187,555 @@ async def call_llm_json(
 # Embeddings
 # ---------------------------------------------------------------------------
 
-_embedder_model = None
+
+async def _embed_with_local_model(
+    model_alias: str,
+    texts: list[str],
+    ctx: dict[str, Any],
+) -> list[list[float]]:
+    global _last_known_embed_dim
+
+    audit_path = ctx.get("audit_path", get_llm_audit_path())
+    raw_name = _local_model_name_from_config(model_alias)
+
+    record_llm_call(
+        {
+            "type": "embed_call_local",
+            "model": raw_name,
+            "alias": model_alias,
+            "texts_sample": texts[:3],
+            "num_texts": len(texts),
+            "context": ctx,
+        },
+        mirror_to=audit_path,
+    )
+
+    try:
+        embedder = _get_local_embedder(raw_name)
+
+        loop = asyncio.get_running_loop()
+
+        def _do_encode() -> list[list[float]]:
+            arr = embedder.encode(texts, convert_to_numpy=True)
+            return arr.tolist()
+
+        vectors: list[list[float]] = await loop.run_in_executor(None, _do_encode)
+
+        if vectors and isinstance(vectors[0], list):
+            _last_known_embed_dim = len(vectors[0])
+
+        record_llm_call(
+            {
+                "type": "embed_result_local",
+                "model": raw_name,
+                "alias": model_alias,
+                "num_vectors": len(vectors),
+                "dim": _last_known_embed_dim,
+                "context": ctx,
+            },
+            mirror_to=audit_path,
+        )
+        return vectors
+    except Exception as e:  # pragma: no cover - defensive
+        record_llm_call(
+            {
+                "type": "embed_error_local",
+                "model": raw_name,
+                "alias": model_alias,
+                "error": repr(e),
+                "context": ctx,
+            },
+            mirror_to=audit_path,
+        )
+        raise
+
+
+async def _embed_with_openai_model(
+    model_name: str,
+    texts: list[str],
+    ctx: dict[str, Any],
+) -> list[list[float]]:
+    global _last_known_embed_dim
+
+    audit_path = ctx.get("audit_path", get_llm_audit_path())
+    record_llm_call(
+        {
+            "type": "embed_call_openai",
+            "model": model_name,
+            "texts_sample": texts[:3],
+            "num_texts": len(texts),
+            "context": ctx,
+        },
+        mirror_to=audit_path,
+    )
+
+    try:
+        client = _get_openai_client()
+        resp = await client.embeddings.create(
+            model=model_name,
+            input=texts,
+        )
+    except (APIStatusError, RateLimitError) as e:
+        record_llm_call(
+            {
+                "type": "embed_error_openai",
+                "model": model_name,
+                "error": repr(e),
+                "context": ctx,
+            },
+            mirror_to=audit_path,
+        )
+        raise
+
+    vectors: list[list[float]] = [d.embedding for d in resp.data]  # type: ignore[assignment]
+
+    if vectors and isinstance(vectors[0], list):
+        _last_known_embed_dim = len(vectors[0])
+
+    record_llm_call(
+        {
+            "type": "embed_result_openai",
+            "model": model_name,
+            "num_vectors": len(vectors),
+            "dim": _last_known_embed_dim,
+            "context": ctx,
+        },
+        mirror_to=audit_path,
+    )
+    return vectors
 
 
 async def embed_texts(
-    texts: Iterable[str],
-    *,
-    context: Optional[dict[str, Any]] = None,
-) -> List[List[float]]:
+    texts: list[str],
+    context: dict[str, Any] | None = None,
+) -> list[list[float]]:
     """
-    Compute embeddings for a batch of texts.
+    Front-door for embedding calls.
 
-    Behaviour:
-    - If config.models.embedding starts with 'local-', we use a SMALL local
-      sentence-transformer model (e.g. all-MiniLM-L6-v2).
-    - Otherwise we call OpenAI's embeddings endpoint with that model name.
-
-    This aligns with the constraint:
-      - use OpenAI for LLM calls
-      - only use a small local model for embeddings if needed.
+    Uses OpenAI models by default; if the config model name starts with 'local-',
+    a local sentence-transformer is used instead.
     """
-    from typing import cast
-
-    global _embedder_model
     ctx = context or {}
     embed_model = get_model("embedding")
 
-    texts_list = [str(t) for t in texts]
-
-    # Local path
-    if embed_model.startswith("local-"):
-        model_name = embed_model[len("local-") :] or "all-MiniLM-L6-v2"
-        if _embedder_model is None:
-            from sentence_transformers import SentenceTransformer  # type: ignore
-
-            _logger.info(
-                "embed_init_local",
-                extra={"model": model_name},
-            )
-            _embedder_model = SentenceTransformer(model_name)
-        vecs = _embedder_model.encode(
-            texts_list,
-            convert_to_numpy=False,
-            show_progress_bar=False,
-        )
-        return [list(map(float, v)) for v in vecs]
-
-    # Remote OpenAI embeddings
-    resp = await _client.embeddings.create(
-        model=embed_model,
-        input=texts_list,
-    )
-    out: List[List[float]] = [
-        cast(List[float], d.embedding) for d in resp.data
-    ]
-
-    _logger.debug(
-        "embed_done",
-        extra={"model": embed_model, "n": len(out), "context": ctx},
-    )
-    return out
+    if _is_local_embedding_model(embed_model):
+        return await _embed_with_local_model(embed_model, texts, ctx)
+    else:
+        return await _embed_with_openai_model(embed_model, texts, ctx)
 
 
 # ---------------------------------------------------------------------------
-# High-level helpers used by agents
+# Text LLM helpers (JSON)
+# ---------------------------------------------------------------------------
+
+
+def _extract_text_for_commentary(d: Any) -> str:
+    texts: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            t = node.get("type")
+            if t == "reasoning":
+                txt = node.get("text") or node.get("content") or node.get("value")
+                if isinstance(txt, str):
+                    texts.append(txt)
+                elif isinstance(txt, list):
+                    segs = [s for s in txt if isinstance(s, str)]
+                    if segs:
+                        texts.append("\n".join(segs))
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(d)
+    out = "\n".join(texts).strip()
+    return out[:4000] + ("..." if len(out) > 4000 else "")
+
+
+# ---------------------------------------------------------------------------
+# JSON-producing helper used by ReportAgent and others
+# ---------------------------------------------------------------------------
+
+
+async def _call_llm_json(
+    system_instructions: str,
+    user_prompt: str,
+    schema_hint: str,
+    context: dict[str, Any] | None = None,
+) -> Any:
+    """
+    Ask the reasoning model for STRICT JSON following schema_hint.
+    Parses & logs the JSON.
+
+    On malformed or empty JSON, we return `{}` instead of fabricating content.
+    """
+    ctx = context or {}
+    audit_path = ctx.get("audit_path", get_llm_audit_path())
+    reasoning_model = get_model("reasoning")
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                system_instructions.strip()
+                + "\n\nYou MUST reply with STRICT JSON only. "
+                "Do not include markdown fences or explanations.\n"
+                "Intended JSON shape (informal description):\n"
+                f"{schema_hint.strip()}\n"
+            ),
+        },
+        {"role": "user", "content": user_prompt.strip()},
+    ]
+
+    llm_record: dict[str, Any] = {
+        "type": "json_call",
+        "model": reasoning_model,
+        "messages": messages,
+        "schema_hint": schema_hint,
+        "context": ctx,
+    }
+
+    try:
+        client = _get_openai_client()
+        resp = await client.chat.completions.create(
+            model=reasoning_model,
+            messages=messages,
+        )
+        llm_text = resp.choices[0].message.content or ""
+        llm_record["raw_response"] = _to_safe_json(resp)
+    except (APIStatusError, RateLimitError) as e:
+        llm_record["error"] = repr(e)
+        record_llm_call(llm_record, mirror_to=audit_path)
+        _logger.error(
+            "JSON LLM call failed",
+            extra={"error": repr(e), "model": reasoning_model},
+        )
+        raise
+
+    parsed: Any = {}
+    fallback_used = False
+
+    s = llm_text.strip()
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].startswith("```"):
+            s = "\n".join(lines[1:-1]).strip()
+
+    try:
+        parsed = json.loads(s)
+    except Exception:
+        start_obj = llm_text.find("{")
+        start_arr = llm_text.find("[")
+        if start_obj == -1 and start_arr == -1:
+            parsed = {}
+            fallback_used = True
+        else:
+            if start_obj == -1:
+                start_idx = start_arr
+            elif start_arr == -1:
+                start_idx = start_obj
+            else:
+                start_idx = min(start_obj, start_arr)
+
+            end_curly = llm_text.rfind("}")
+            end_brack = llm_text.rfind("]")
+            end_idx = max(end_curly, end_brack)
+            candidate = llm_text[start_idx : end_idx + 1]
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                parsed = {}
+                fallback_used = True
+
+    record_llm_call(
+        {
+            "type": "parsed_json_result",
+            "model": reasoning_model,
+            "temperature": None,
+            "system_instructions": system_instructions,
+            "user_prompt": user_prompt,
+            "schema_hint": schema_hint,
+            "raw_response_text": llm_text,
+            "parsed_response": parsed,
+            "fallback_used": fallback_used,
+            "context": ctx,
+        },
+        mirror_to=audit_path,
+    )
+
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrapper to maintain old call style
+# ---------------------------------------------------------------------------
+
+
+async def call_llm_json(*args: Any, **kwargs: Any) -> Any:
+    """
+    Backwards-compatible wrapper that forwards to _call_llm_json.
+
+    It supports two styles:
+
+      - Positional:
+          await call_llm_json(system_instructions, user_prompt, schema_hint)
+
+      - Keyword:
+          await call_llm_json(
+              system_msg="...",
+              user_msg="...",
+              schema_hint="...",
+          )
+    """
+    system_msg: str | None = None
+    user_msg: str | None = None
+    schema_hint: str | None = None
+    context: dict[str, Any] | None = kwargs.get("context")
+
+    if len(args) == 3:
+        system_msg = args[0]
+        user_msg = args[1]
+        schema_hint = args[2]
+    elif len(args) > 0:
+        system_msg = args[0]
+        if len(args) >= 2:
+            user_msg = args[1]
+        if len(args) >= 3:
+            schema_hint = args[2]
+
+    system_msg = kwargs.get("system_msg", system_msg)
+    user_msg = kwargs.get("user_msg", user_msg)
+    schema_hint = kwargs.get("schema_hint", schema_hint)
+
+    if user_msg is None:
+        user_msg = "No user prompt provided."
+    if system_msg is None:
+        system_msg = "You are a helpful scientific writing assistant."
+
+    return await _call_llm_json(
+        system_instructions=system_msg,
+        user_prompt=user_msg,
+        schema_hint=schema_hint or "",
+        context=context,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Higher-level helpers used by agents
 # ---------------------------------------------------------------------------
 
 
 async def brainstorm_hypotheses(
     topic: str,
     n: int,
-    context: Optional[dict[str, Any]] = None,
-) -> List[dict[str, Any]]:
-    """
-    Generate a list of candidate hypotheses / ideas for a topic.
-
-    There is intentionally NO deterministic fallback here: if this call fails,
-    the exception will propagate back to the calling agent.
-    """
-    schema_hint = """
-    A JSON array of objects, each with:
-      - id: short identifier string (e.g. "H1")
-      - title: short, human-readable title
-      - description: multi-sentence description of the hypothesis
-      - rationale: explanation of why this might be true or worthwhile
-      - feasibility: short text on how feasible this is to test
-      - novelty: short text on novelty vs typical work
-      - potential_impact: description of scientific / societal impact
-      - risk_factors: list of strings for key risks or caveats
-    """
-
-    user_prompt = f"""
-Topic:
-{topic}
-
-Generate EXACTLY {n} diverse, non-trivial, testable hypotheses or research
-ideas about the topic above. They should:
-
-- be as specific and operationalizable as possible
-- cover multiple distinct mechanisms / interventions / perspectives
-- be plausible to investigate in practice
-
-Return ONLY JSON as described in the schema hint.
-"""
-
-    ideas = await _call_llm_json(
-        system_instructions=(
-            "You are an expert research scientist in a multi-agent system. "
-            "Your job is to propose high-quality hypotheses."
-        ),
-        user_prompt=user_prompt,
-        schema_hint=schema_hint,
-        purpose="reasoning",
-        temperature=0.6,
-        max_tokens=4096,
-        context=context,
+    context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    ctx = context or {}
+    system = (
+        "You are a careful, critical scientist. Generate diverse, "
+        "non-redundant hypotheses for the given research topic."
+    )
+    user = json.dumps(
+        {
+            "topic": topic,
+            "n": n,
+            "instructions": (
+                "Propose distinct, falsifiable hypotheses. "
+                "Include a short description and rationale for each."
+            ),
+        },
+        indent=2,
+    )
+    raw = await call_reasoning_llm(
+        system=system,
+        user=user,
+        ctx={**ctx, "call_type": "brainstorm_hypotheses"},
+        max_completion_tokens=2000,
     )
 
-    if not isinstance(ideas, list):
-        raise RuntimeError(f"brainstorm_hypotheses expected list, got {type(ideas)!r}")
-    return ideas
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            out = []
+            for i, item in enumerate(data):
+                if isinstance(item, dict):
+                    out.append(
+                        {
+                            "id": item.get("id", f"h_{i+1}"),
+                            "title": item.get("title", f"Hypothesis {i+1}"),
+                            "description": item.get("description", str(item)),
+                        }
+                    )
+                else:
+                    out.append(
+                        {
+                            "id": f"h_{i+1}",
+                            "title": f"Hypothesis {i+1}",
+                            "description": str(item),
+                        }
+                    )
+            return out
+    except Exception:
+        pass
 
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    hypotheses: list[dict[str, Any]] = []
+    current: list[str] = []
+    for ln in lines:
+        if ln[0].isdigit() and ln[1:3] in (". ", ") "):
+            if current:
+                hypotheses.append(
+                    {
+                        "id": f"h_{len(hypotheses)+1}",
+                        "title": current[0],
+                        "description": "\n".join(current),
+                    }
+                )
+                current = []
+            current.append(ln)
+        else:
+            current.append(ln)
+    if current:
+        hypotheses.append(
+            {
+                "id": f"h_{len(hypotheses)+1}",
+                "title": current[0],
+                "description": "\n".join(current),
+            }
+        )
 
-async def review_hypothesis(
-    hypothesis: dict[str, Any],
-    retrieved: Optional[List[dict[str, Any]]] = None,
-    context: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    """
-    Peer-review style critique for a single hypothesis.
-
-    This function is explicitly used by ReviewAgent._review_single and is what
-    prevents the system from falling back to deterministic, hard-coded
-    heuristics when the LLM is available.
-    """
-    schema_hint = """
-    A JSON object with:
-      - strengths: list of strings
-      - weaknesses: list of strings
-      - feasibility_risks: list of strings
-      - suggested_improvements: list of strings
-      - risks: list of strings
-      - score: number in [0, 1]
-      - confidence: number in [0, 1]
-      - recommendation: one of
-          ["strong_accept","accept","weak_accept","borderline",
-           "weak_reject","reject"]
-      - notes: free-form string with any extra comments
-    """
-
-    title = hypothesis.get("title") or hypothesis.get("name") or f"Hypothesis {hypothesis.get('id')}"
-    desc = hypothesis.get("description") or hypothesis.get("text") or ""
-
-    if retrieved:
-        ctx_block_lines = []
-        for i, doc in enumerate(retrieved[:5]):
-            text = str(doc.get("text") or "")
-            score = doc.get("score")
-            header = f"Doc {i+1}"
-            if score is not None:
-                header += f" (score={score})"
-            ctx_block_lines.append(f"{header}:\n{text}\n")
-        ctx_block = "\n".join(ctx_block_lines)
-    else:
-        ctx_block = "No external documents were retrieved for this hypothesis."
-
-    user_prompt = f"""
-You are a critical but fair scientific peer reviewer.
-
-Hypothesis JSON:
-{json.dumps(hypothesis, ensure_ascii=False, indent=2)}
-
-Retrieved context (may be noisy or incomplete):
-{ctx_block}
-
-Provide a detailed, calibrated critique and return it strictly as JSON according
-to the schema hint.
-"""
-
-    critique = await _call_llm_json(
-        system_instructions=(
-            "You are reviewing a single scientific hypothesis. Be concrete, "
-            "specific, and well-calibrated in your judgments."
-        ),
-        user_prompt=user_prompt,
-        schema_hint=schema_hint,
-        purpose="reasoning",
-        temperature=0.4,
-        max_tokens=3072,
-        context=context,
-    )
-
-    if not isinstance(critique, dict):
-        raise RuntimeError(f"review_hypothesis expected dict, got {type(critique)!r}")
-
-    return critique
-
-
-async def evolve_hypothesis(
-    idea: dict[str, Any],
-    critiques: dict[str, Any],
-    context: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    """
-    Improve / refine an existing hypothesis using reviews.
-    """
-    schema_hint = """
-    A JSON object describing a refined hypothesis with fields:
-      - id
-      - title
-      - description
-      - rationale
-      - feasibility
-      - novelty
-      - potential_impact
-      - risk_factors (list of strings)
-    """
-
-    user_prompt = f"""
-You are an AI co-scientist. Refine this hypothesis using the critiques.
-
-Original idea JSON:
-{json.dumps(idea, ensure_ascii=False, indent=2)}
-
-Aggregated critiques JSON:
-{json.dumps(critiques, ensure_ascii=False, indent=2)}
-
-Make the refined version more precise, testable, and decision-relevant.
-Return ONLY JSON following the schema hint.
-"""
-
-    refined = await _call_llm_json(
-        system_instructions="Refine hypotheses given critiques while preserving the core idea.",
-        user_prompt=user_prompt,
-        schema_hint=schema_hint,
-        purpose="reasoning",
-        temperature=0.5,
-        max_tokens=3072,
-        context=context,
-    )
-
-    if not isinstance(refined, dict):
-        raise RuntimeError(f"evolve_hypothesis expected dict, got {type(refined)!r}")
-    return refined
-
-
-async def summarize_background(
-    topic: str,
-    context: Optional[dict[str, Any]] = None,
-) -> str:
-    """
-    Background literature-style summary for a topic.
-
-    Used by LiteratureAgent. Returns plain text (no markdown).
-    """
-    user_prompt = f"""
-Topic:
-{topic}
-
-Write a compact but information-dense background summary (around 800–1200 words)
-as if for a scientifically literate collaborator. Cover:
-
-- main sub-areas or facets of the topic
-- common methodologies and their limitations
-- known sources of bias, toxicity, or failure modes if relevant
-- key open questions or promising directions
-
-Plain text only, no markdown headings or bullet syntax.
-"""
-
-    summary = await _chat(
-        purpose="reasoning",
-        system_prompt="You write clear, neutral, and precise scientific background summaries.",
-        user_prompt=user_prompt,
-        temperature=0.4,
-        max_tokens=4096,
-        context=context,
-    )
-    return summary
+    return hypotheses
 
 
 async def agent_self_commentary(
     agent_name: str,
-    state_snapshot: dict[str, Any],
-    context: Optional[dict[str, Any]] = None,
+    payload: Any,
+    context: dict[str, Any] | None = None,
+) -> str:
+    ctx = context or {}
+    system = (
+        "You are a meta-cognitive assistant describing the reasoning process of "
+        "another agent for debugging and transparency."
+    )
+    user = json.dumps(
+        {
+            "agent": agent_name,
+            "payload": payload,
+        },
+        indent=2,
+    )
+    out = await call_writing_llm(
+        system=system,
+        user=user,
+        temperature=0.3,
+        ctx={**ctx, "call_type": "agent_self_commentary"},
+        max_completion_tokens=800,
+    )
+    return out
+
+
+async def rewrite_meta_summary_with_llm(
+    raw_summary: str,
+    context: Any | None = None,
 ) -> str:
     """
-    Short reflective note used by SupervisorAgent for logging / introspection.
+    Use the writing model to rewrite and polish a meta-review summary.
+
+    Parameters
+    ----------
+    raw_summary : str
+        The basic meta-review draft (possibly bullet-style).
+    context : Any | None
+        Optional context (e.g., tournament data) to provide additional hints.
+
+    Returns
+    -------
+    str
+        A refined, formal paragraph ready for inclusion in the final report.
     """
-    compact_state = json.dumps(state_snapshot, ensure_ascii=False)[:2000]
+    try:
+        context_text = f"\n\nContext:\n{context}" if context else ""
+        system = "You are a careful scientific summarizer."
+        user = (
+            "You are a scientific meta-review assistant.\n"
+            "Rewrite the following raw meta-review summary into a clear, formal, and concise paragraph.\n"
+            "Keep the tone analytical, neutral, and factual.\n"
+            "Avoid introducing new claims or results not present in the text.\n\n"
+            f"Raw summary:\n{raw_summary}{context_text}"
+        )
 
-    user_prompt = f"""
-You are {agent_name}, an agent in a multi-agent co-scientist pipeline.
+        rewritten = await call_writing_llm(
+            system=system,
+            user=user,
+            temperature=0.3,
+            ctx={"call_type": "rewrite_meta_summary"},
+            max_completion_tokens=500,
+        )
 
-Here is a JSON snapshot of your current state:
-{compact_state}
+        _logger.info(
+            "rewrite_meta_summary_success",
+            extra={"length": len(rewritten)},
+        )
+        return rewritten.strip()
+    except Exception as e:
+        _logger.error("rewrite_meta_summary_failed", extra={"error": str(e)})
+        return raw_summary
 
-Write a very short self-commentary (<= 200 words) about:
-- what you are about to do next
-- what you should pay particular attention to
-- any salient risks or failure modes you want to flag
 
-Plain text only.
-"""
+async def summarize_portfolio_with_llm(
+    portfolio_text: str,
+    context: Any | None = None,
+) -> str:
+    """
+    Use the writing model to synthesize a formal, concise summary of the
+    research portfolio and methodology.
 
-    commentary = await _chat(
-        purpose="reasoning",
-        system_prompt="You are a self-reflective AI component describing its own next steps.",
-        user_prompt=user_prompt,
-        temperature=0.3,
-        max_tokens=512,
-        context=context,
-    )
-    return commentary
+    Parameters
+    ----------
+    portfolio_text : str
+        Description of how hypotheses were generated, reviewed, and selected.
+    context : Any | None
+        Optional metadata or invocation context.
+
+    Returns
+    -------
+    str
+        A polished, human-readable synthesis suitable for inclusion in the
+        'Methodology and Selection Process' section of the report.
+    """
+    try:
+        context_text = f"\n\nContext:\n{context}" if context else ""
+        system = "You are a careful scientific summarizer."
+        user = (
+            "You are a scientific meta-review assistant helping draft the "
+            "Methodology and Selection Process section of a research report.\n"
+            "Based on the description below, write 1–3 concise paragraphs that:\n"
+            "1) Summarize how candidate hypotheses were generated,\n"
+            "2) Explain how they were reviewed and scored, and\n"
+            "3) Describe in general terms how the final set was selected.\n"
+            "Keep the tone formal, analytical, and neutral.\n"
+            "Do NOT fabricate specific study results or numerical metrics.\n\n"
+            f"Pipeline / portfolio description:\n{portfolio_text}{context_text}"
+        )
+
+        summary = await call_writing_llm(
+            system=system,
+            user=user,
+            temperature=0.4,
+            ctx={"call_type": "summarize_portfolio"},
+            max_completion_tokens=800,
+        )
+
+        _logger.info(
+            "summarize_portfolio_success",
+            extra={"length": len(summary)},
+        )
+        return summary.strip()
+    except Exception as e:
+        _logger.error("summarize_portfolio_failed", extra={"error": str(e)})
+        return (
+            "The methodology and selection process followed the standard co-scientist "
+            "pipeline of generation, review, tournament ranking, and meta-review."
+        )

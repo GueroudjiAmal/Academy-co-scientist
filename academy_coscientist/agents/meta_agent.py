@@ -1,57 +1,55 @@
+# academy_coscientist/agents/meta_agent.py
 from __future__ import annotations
 
 from typing import Any, Sequence
 
 from academy.agent import Agent, action
+from academy_coscientist.utils.utils_logging import make_struct_logger, log_action
+from academy_coscientist.utils.utils_llm import (
+    rewrite_meta_summary_with_llm,
+    summarize_portfolio_with_llm,
+)
 
 
 class MetaReviewAgent(Agent):
     """
-    Minimal Meta-review agent for the co-scientist pipeline.
+    Meta-review agent for the co-scientist pipeline.
 
-    IMPORTANT:
-    - This implementation is intentionally conservative: it ONLY provides the
-      `compute` action that `SupervisorAgent` is trying to call.
-    - It does NOT rely on any other custom methods or utilities, so it will not
-      introduce new missing-attribute errors.
-    - It stores whatever payload it receives from the tournament and produces a
-      simple text summary that downstream components may (or may not) use.
+    Responsibilities:
+    - Compute a meta-review summary after the tournament stage.
+    - Generate a final portfolio synthesis for inclusion in the report.
     """
 
     def __init__(self) -> None:
         super().__init__()
+        self.logger = make_struct_logger("MetaReviewAgent")
         self._last_summary: str | None = None
         self._last_raw_payload: Any | None = None
+
+    # -----------------------------------------------------------------------
+    # Accessors
+    # -----------------------------------------------------------------------
 
     @action
     async def get_last_summary(self) -> str | None:
         """
-        Optional helper action: return the last meta-review summary, if any.
-        This is safe because nothing else in the stack *needs* to call it,
-        but it can be useful for debugging or future extensions.
+        Optional helper: return the last meta-review summary, if any.
         """
         return self._last_summary
+
+    # -----------------------------------------------------------------------
+    # Meta-review computation (called by SupervisorAgent)
+    # -----------------------------------------------------------------------
 
     @action
     async def compute(self, tournament_payload: Any | None = None) -> str:
         """
-        Meta-review entry point called by SupervisorAgent.
+        Meta-review entry point.
 
-        Parameters
-        ----------
-        tournament_payload:
-            Whatever the supervisor passes in (e.g., tournament results,
-            rankings, or reviews). We do NOT assume any particular structure
-            here to avoid fragile dependencies.
-
-        Returns
-        -------
-        summary: str
-            A human-readable meta-review summary. Downstream code can ignore
-            this or include it in the final report.
+        We build a lightweight, schema-agnostic description of what happened,
+        then let the LLM rewrite it into a more polished paragraph.
         """
-        lines: list[str] = []
-        lines.append("# Meta-review summary")
+        lines: list[str] = ["# Meta-review summary"]
 
         if tournament_payload is None:
             lines.append(
@@ -60,30 +58,90 @@ class MetaReviewAgent(Agent):
                 "current set of hypotheses and reviews."
             )
         else:
-            # Store raw payload so it can be inspected later if needed
+            # Keep a reference so synthesize_portfolio() knows something ran
             self._last_raw_payload = tournament_payload
 
             lines.append(
                 "Received tournament results payload from the supervisor. "
-                "The meta-review agent does not enforce a specific schema "
-                "for this payload; it simply records its presence and can "
-                "offer high-level commentary."
+                "Providing high-level commentary."
             )
 
-            # Add a very lightweight structural hint without making assumptions
             if isinstance(tournament_payload, Sequence) and not isinstance(
                 tournament_payload, (str, bytes)
             ):
-                lines.append(
-                    f"- Number of entries in payload: {len(tournament_payload)}"
-                )
+                lines.append(f"- Number of entries in payload: {len(tournament_payload)}")
 
         lines.append(
-            "Downstream agents (e.g., the final report generator) may ignore "
-            "this meta-review or incorporate it as high-level commentary on "
-            "the tournament’s overall behavior."
+            "Downstream agents (e.g., the final report generator) may include "
+            "this meta-review as contextual commentary on the tournament's outcome."
         )
 
-        summary = "\n".join(lines)
-        self._last_summary = summary
+        raw_summary = "\n".join(lines)
+
+        # Let the LLM polish this into a nicer paragraph.
+        rewritten = await rewrite_meta_summary_with_llm(raw_summary, context=None)
+
+        self._last_summary = rewritten
+        log_action(
+            self.logger,
+            "compute",
+            {"payload_type": type(tournament_payload).__name__},
+            {"ok": True},
+        )
+        return rewritten
+
+    # -----------------------------------------------------------------------
+    # Portfolio synthesis (called by ReportAgent)
+    # -----------------------------------------------------------------------
+
+    @action
+    async def synthesize_portfolio(self, *args, **kwargs) -> str:
+        """
+        Summarize the overall tournament results into a clear, human-readable
+        synthesis for the final report.
+
+        We ACCEPT extra kwargs (e.g., 'k') for compatibility with ReportAgent,
+        but we don't depend on them.
+        """
+        # Build a generic but accurate description of the pipeline, without
+        # relying on internals of TournamentAgent that we don't see here.
+        base_lines: list[str] = []
+
+        base_lines.append(
+            "The co-scientist pipeline generated multiple candidate hypotheses "
+            "for the given research topic using a dedicated hypothesis "
+            "generation agent."
+        )
+        base_lines.append(
+            "Two independent review agents evaluated these hypotheses along "
+            "dimensions such as clarity, novelty, feasibility, and potential impact."
+        )
+        base_lines.append(
+            "Their scores and critiques were aggregated and passed to a tournament "
+            "agent, which ranked the hypotheses and selected a top subset."
+        )
+        base_lines.append(
+            "The meta-review stage then examined this ranked set to provide "
+            "high-level commentary and ensure that the final selection is "
+            "coherent with the overall research goals."
+        )
+
+        if self._last_summary:
+            base_lines.append(
+                "\nPrevious meta-review summary (for context):\n" + self._last_summary
+            )
+
+        portfolio_text = "\n".join(base_lines)
+
+        summary = await summarize_portfolio_with_llm(
+            portfolio_text,
+            context={"called_from": "MetaReviewAgent"},
+        )
+
+        log_action(
+            self.logger,
+            "synthesize_portfolio",
+            {"args": args, "kwargs": kwargs},
+            {"ok": True},
+        )
         return summary

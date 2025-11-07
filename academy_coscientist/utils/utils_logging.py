@@ -177,10 +177,10 @@ def log_action(
     )
     # Human-readable
     logger.debug(
-        'action=%s input_keys=%s output_keys=%s',
+        'action=%s input=%s output=%s',
         action,
-        list((input_payload or {}).keys()),
-        list((output_payload or {}).keys()),
+        list(input_payload or {}),
+        list(output_payload or {}),
     )
 
 

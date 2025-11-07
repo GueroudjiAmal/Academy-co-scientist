@@ -6,7 +6,7 @@ launch:
 models:
   reasoning: "o4-mini"          # instead of gpt-5-reasoning
   writing: "gpt-4o"             # instead of gpt-5o-mini
-  embedding: "text-embedding-3-small"
+  embedding: "local-all-MiniLM-L6-v2" #"text-embedding-3-small"
   # To run fully local embeddings, you could use:
   # embedding: "local-all-MiniLM-L6-v2"
 
