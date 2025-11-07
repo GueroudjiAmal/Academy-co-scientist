@@ -1,7 +1,7 @@
 
 # Academy Co-Scientist Tutorial
 
-Welcome to the **Academy Co-Scientist** tutorial repository. This project showcases how to build and orchestrate a multi-agent research assistant pipeline using [Academy](https://github.com/academy-agents/academy). Agents collaborate to generate hypotheses, review ideas, and synthesize reports — all autonomously.
+Welcome to the **Academy Co-Scientist** repository. This project showcases how to build and orchestrate a multi-agent research assistant pipeline using [Academy](https://github.com/academy-agents/academy). Agents collaborate to generate hypotheses, review ideas, and synthesize reports — all autonomously.
 
 ---
 
@@ -42,6 +42,7 @@ python -m venv venv
 source venv/bin/activate
 pip install -e .
 ```
+---
 
 ### Globus Compute (Optional)
 
@@ -62,7 +63,7 @@ Edit the `config.yml` file in the root directory:
 launch:
   topic: "AI Reliability enhancement"
   embeddings_dir: "embeddings"
-  docs_dir: "DOCs"
+  docs_dir: "research_papers"
   abstracts_cache_dir: "embeddings/abstracts"
 ```
 
@@ -75,31 +76,26 @@ launch:
 Run the pipeline using:
 
 ```bash
-python -m academy_coscientist.launcher --config config.yml
+python -m academy_coscientist.launcher --config academy_coscientist/config.yaml --topic "Reliable AI" --hypotheses-count 2
 ```
 
-Or override the topic:
-
-```bash
-python -m academy_coscientist.launcher --config config.yml --topic "Your new topic"
-```
 
 The final output will be a report with top-ranked hypotheses and analysis.
 
 ---
 
 ## Agents Overview
-|-------------------------------------------------------------------------------------|
-| Agent                 | Role                                                        |
-|-----------------------|-------------------------------------------------------------|
-| `GenerationAgent`     | Generates initial ideas from the topic                      |
-| `ReviewAgent`         | Evaluates and scores hypotheses                             |
-| `TournamentAgent`     | Runs pairwise comparisons to rank hypotheses                |
-| `MetaAgent`           | Analyzes reviewer consistency and refines rankings          |
-| `ReportAgent`         | Synthesizes the final report                                |
-| `SupervisorAgent`     | Orchestrates all other agents                               |
-| `VectorStoreAgent`    | Handles embedding and document retrieval                    |
-|-------------------------------------------------------------------------------------|
+
+| Agent                      | Role                                                        |
+|----------------------------|-------------------------------------------------------------|
+| `GenerationAgent`          | Generates initial ideas from the topic                      |
+| `ReviewAgent`              | Evaluates and scores hypotheses                             |
+| `TournamentAgent`          | Runs pairwise comparisons to rank hypotheses                |
+| `MetaAgent`                | Analyzes reviewer consistency and refines rankings          |
+| `ReportAgent`              | Synthesizes the final report                                |
+| `SupervisorAgent`          | Orchestrates all other agents                               |
+| `ResearchVectorDBAgent`    | Handles embedding and document retrieval                    |
+| `LiteratureAgent`          | Summarizes the returned literature by the VecrDB agent      |
 ---
 
 ## Project Structure
@@ -114,7 +110,7 @@ academy_coscientist/
 │
 ├── utils/                 # Utility functions
 │   ├── config.py
-│   ├── vector_store.py
+│   ├── util_llm.py
 │   └── ...
 │
 ├── launcher.py           # Main pipeline launcher
