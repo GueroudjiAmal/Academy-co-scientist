@@ -87,6 +87,8 @@ The final output will be a report with top-ranked hypotheses and analysis.
 
 ## Agents Overview
 
+![Figure caption: Architecture of the federated co-scientist prototype.](media/coscientist.png)
+
 | Agent                      | Role                                                        |
 |----------------------------|-------------------------------------------------------------|
 | `GenerationAgent`          | Generates initial ideas from the topic                      |
@@ -98,6 +100,7 @@ The final output will be a report with top-ranked hypotheses and analysis.
 | `ResearchVectorDBAgent`    | Handles embedding and document retrieval                    |
 | `LiteratureAgent`          | Summarizes the returned literature by the VecrDB agent      |
 ---
+
 
 ## Project Structure
 
