@@ -42,7 +42,7 @@ class MetaReviewAgent(Agent):
     # -----------------------------------------------------------------------
 
     @action
-    async def compute(self, tournament_payload: Any | None = None) -> str:
+    async def compute(self, tournament_payload: Any | None = None, context: Any | None = None) -> str:
         """
         Meta-review entry point.
 
@@ -50,31 +50,39 @@ class MetaReviewAgent(Agent):
         then let the LLM rewrite it into a more polished paragraph.
         """
         lines: list[str] = ["# Meta-review summary"]
-
         if tournament_payload is None:
             lines.append(
                 "No structured tournament payload was provided; "
                 "meta-review falls back to a generic reflection over the "
                 "current set of hypotheses and reviews."
             )
-        else:
-            # Keep a reference so synthesize_portfolio() knows something ran
-            self._last_raw_payload = tournament_payload
+        elif context is None:
 
             lines.append(
-                "Received tournament results payload from the supervisor. "
+                "No context from litterature was provided; "
+
+            )
+        else:
+            self._last_raw_payload = tournament_payload
+            self._context = context
+
+            lines.append(
+                "Received tournament results payload and context from the supervisor. "
                 "Providing high-level commentary."
             )
 
-            if isinstance(tournament_payload, Sequence) and not isinstance(
-                tournament_payload, (str, bytes)
-            ):
-                lines.append(f"- Number of entries in payload: {len(tournament_payload)}")
+
+            lines.append(f"- Number of entries in payload: {len(tournament_payload)}")
+            lines.append(tournament_payload)
+            lines.append("And here is the context from the litterature:")
+            lines.append(context)
 
         lines.append(
             "Downstream agents (e.g., the final report generator) may include "
             "this meta-review as contextual commentary on the tournament's outcome."
         )
+
+
 
         raw_summary = "\n".join(lines)
 
@@ -85,7 +93,7 @@ class MetaReviewAgent(Agent):
         log_action(
             self.logger,
             "compute",
-            {"payload_type": type(tournament_payload).__name__},
+            {"payload_type": type(tournament_payload).__name__, "context": type(context)},
             {"ok": True},
         )
         return rewritten

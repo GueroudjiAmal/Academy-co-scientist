@@ -95,12 +95,12 @@ class LiteratureAgent(Agent):
         )
 
         summary = await utils_llm.call_writing_llm(
-            system="You are a helpful research assistant.",
+            system="You are a helpful research assistant, specialized in litterature reviews.",
             user=prompt,
             temperature=0.4,
             max_completion_tokens=800,
         )
-        print("this is the summary from the litterature", summary)
+        print("Summary from the litterature:","\n", summary)
         self._summary_cache = summary
         log_action(
             self.logger,

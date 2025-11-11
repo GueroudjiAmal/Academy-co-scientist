@@ -316,9 +316,10 @@ class SupervisorAgent(Agent):
                 )
 
         # 6. Meta-analysis (with optional literature context)
+        leaderboard = await self.tournament.get_leaderboard()
         meta_variants = (
-            ((self.tournament, literature_summary), {}),
-            ((self.tournament,), {}),
+            ((leaderboard, literature_summary), {}),
+            ((leaderboard,), {}),
             ((), {}),
         )
         await _try_call_variants(self.meta, "compute", meta_variants)

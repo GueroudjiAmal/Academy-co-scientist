@@ -235,19 +235,6 @@ class ReportAgent(Agent):
             "\n".join(original_lines) if original_lines else "(no ideas)"
         )
 
-        # Ask meta-agent (if configured) for a high-level synthesis of selection
-        selection_process_text = ""
-        if self._meta and hasattr(self._meta, "synthesize_portfolio"):
-            try:
-                selection_process_text = await self._meta.synthesize_portfolio(
-                    k=top_n
-                )
-            except Exception as e:
-                self.logger.exception(
-                    "meta_synthesis_failed",
-                    extra={"error": repr(e)},
-                )
-
         # Expand top ideas with more detail (LLM)
         detailed_sections: list[str] = []
         if detail:
@@ -291,22 +278,19 @@ class ReportAgent(Agent):
             "# Co-Scientist Report\n",
             "## Topic",
             topic,
-            "",
-            "## Methodology and Selection Process",
-            (
-                selection_process_text
-                or "Ideas were generated, reviewed by multiple agents, scored, "
-                "and ranked based on aggregate score and reviewer confidence."
-            ),
-            "",
-            "## Original Idea Set",
-            original_block,
-            "",
             "## Top Recommendations and Detailed Plans",
             detailed_block or "(No detailed plans available.)",
         ]
+        prompt = (
+            f"You are generating a report.\n"
+            f"Use the following parts :\n{report_parts}\n\n"
+            "Write a clear, report with the different hypothesis and."
+        )
+        final_report = await utils_llm.call_writing_llm(
+            system="You are a helpful research assistant, generate a final report with the different hypothesis, plans and so on.",
+            user=prompt,
+        )
 
-        final_report = "\n\n".join(report_parts)
         log_action(
             self.logger,
             "generate_final_report",
