@@ -9,7 +9,7 @@ authors = [{ name = "Amal Gueroudji", email = "agueroudji@anl.gov" }]
 maintainers = [{ name = "Amal Gueroudji", email = "agueroudji@anl.gov" }]
 description = "Materials for academy co-scientist"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 classifiers = [
   "License :: OSI Approved :: MIT License",

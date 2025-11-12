@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import asyncio
+import logging
 import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
@@ -35,25 +36,29 @@ async def _run_with_manager(
     n_hypotheses: int,
     review_k: Optional[int],
 ) -> str:
-    logger = make_struct_logger("launcher.manager")
-    if 'ACADEMY_TUTORIAL_ENDPOINT' in os.environ:
-        executor = GCExecutor(os.environ['ACADEMY_TUTORIAL_ENDPOINT'])
-        print("Setting up globus")
+    api_key = os.environ["OPENAI_API_KEY"]
 
-    else:
-        mp_context = multiprocessing.get_context('spawn')
-        executor = ProcessPoolExecutor(
-            max_workers=32,
-            initializer=init_logging,
-            mp_context=mp_context,
-        )
+    logger = make_struct_logger("launcher.manager")
+    executors =  {
+        "local": None,
+        "midway": GCExecutor(
+            "f93755e6-7cc7-4479-b1c5-0d2099049aea",
+            user_endpoint_config={
+                "worker_init": f". /home/alokvk2/agents/Academy-co-scientist/venv/bin/activate; export OPENAI_API_KEY={api_key}"
+            },
+        ),
+        "aurora": GCExecutor(
+            "fa9b050c-d71b-406e-9c80-a7aac8dbee2b",
+            user_endpoint_config={"worker_init": f". /flare/workflow_scaling/alokvk2/agents/Academy-co-scientist/venv/bin/activate; export OPENAI_API_KEY={api_key}"},
+        ),
+    }
 
     async with await Manager.from_exchange_factory(
     factory=HttpExchangeFactory(
         EXCHANGE_ADDRESS,
         auth_method='globus',
     ),
-    executors=executor,
+    executors=executors,
     ) as manager:
     # async with await Manager.from_exchange_factory(
     #     factory=LocalExchangeFactory(),
@@ -62,22 +67,23 @@ async def _run_with_manager(
 
 
         # --- Launch all agents ---
-        vectordb = await manager.launch(ResearchVectorDBAgent)
+        vectordb = await manager.launch(ResearchVectorDBAgent, executor="midway")
         await vectordb.ping()
-        generation = await manager.launch(HypothesisGenerationAgent)
+        generation = await manager.launch(HypothesisGenerationAgent, executor="midway")
         await generation.ping()
-        reviewer1 = await manager.launch(ReviewAgent)
+        reviewer1 = await manager.launch(ReviewAgent, executor="midway")
         await reviewer1.ping()
-        reviewer2 = await manager.launch(ReviewAgent)
+        reviewer2 = await manager.launch(ReviewAgent, executor="midway")
         await reviewer2.ping()
-        tournament = await manager.launch(TournamentAgent)
-        meta = await manager.launch(MetaReviewAgent)
+        tournament = await manager.launch(TournamentAgent, executor="aurora")
+        await tournament.ping()
+        meta = await manager.launch(MetaReviewAgent, executor="aurora")
         await meta.ping()
-        reporter = await manager.launch(ReportAgent)
+        reporter = await manager.launch(ReportAgent, executor="aurora")
         await reporter.ping()
-        literature = await manager.launch(LiteratureAgent)
+        literature = await manager.launch(LiteratureAgent, executor="aurora")
         await literature.ping()
-        supervisor = await manager.launch(SupervisorAgent)
+        supervisor = await manager.launch(SupervisorAgent, executor="local")
         await supervisor.ping()
 
         # --- Wire them together ---

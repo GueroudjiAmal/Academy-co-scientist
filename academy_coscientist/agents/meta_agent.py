@@ -72,7 +72,7 @@ class MetaReviewAgent(Agent):
 
 
             lines.append(f"- Number of entries in payload: {len(tournament_payload)}")
-            lines.append(tournament_payload)
+            lines.append(str(tournament_payload))
             lines.append("And here is the context from the litterature:")
             lines.append(context)
 
