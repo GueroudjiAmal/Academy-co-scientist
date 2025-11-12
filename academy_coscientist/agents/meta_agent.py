@@ -81,10 +81,10 @@ class MetaReviewAgent(Agent):
             "this meta-review as contextual commentary on the tournament's outcome."
         )
 
-        raw_summary = "\n".join(lines)
+        #raw_summary = "\n".join(lines)
 
         # Let the LLM polish this into a nicer paragraph.
-        rewritten = await rewrite_meta_summary_with_llm(raw_summary, context=None)
+        rewritten = await rewrite_meta_summary_with_llm(lines, context=None)
         self._last_summary = rewritten
         log_action(
             self.logger,
