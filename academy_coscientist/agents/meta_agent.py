@@ -49,6 +49,7 @@ class MetaReviewAgent(Agent):
         We build a lightweight, schema-agnostic description of what happened,
         then let the LLM rewrite it into a more polished paragraph.
         """
+        print("i am inside compute", flush=True)
         lines: list[str] = ["# Meta-review summary"]
         if tournament_payload is None:
             lines.append(
@@ -57,12 +58,11 @@ class MetaReviewAgent(Agent):
                 "current set of hypotheses and reviews."
             )
         elif context is None:
-
             lines.append(
                 "No context from litterature was provided; "
-
             )
         else:
+            print("here in else append", flush=True)
             self._last_raw_payload = tournament_payload
             self._context = context
 
@@ -81,13 +81,14 @@ class MetaReviewAgent(Agent):
             "Downstream agents (e.g., the final report generator) may include "
             "this meta-review as contextual commentary on the tournament's outcome."
         )
+        print("before join ", len(lines), flush=True)
 
 
-
-        raw_summary = "\n".join(lines)
+        # raw_summary = "\n".join(lines)
+        print("here in cpt, before llm", flush=True)
 
         # Let the LLM polish this into a nicer paragraph.
-        rewritten = await rewrite_meta_summary_with_llm(raw_summary, context=None)
+        rewritten = await rewrite_meta_summary_with_llm(lines, context=None)
 
         self._last_summary = rewritten
         log_action(

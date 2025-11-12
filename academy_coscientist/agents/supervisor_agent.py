@@ -266,36 +266,41 @@ class SupervisorAgent(Agent):
     @action
     async def run_full_cycle(self) -> str:
         """Run the entire end-to-end pipeline."""
-        commentary = await utils_llm.agent_self_commentary(
-            "SupervisorAgent",
-            {"phase": "start", "topic": self._topic},
-            context={"agent": "SupervisorAgent", "action": "self_commentary"},
-        )
-        self.logger.debug("self_commentary", extra={"sample": commentary[:200]})
+        print("in run full cycle")
+        # commentary = await utils_llm.agent_self_commentary(
+        #     "SupervisorAgent",
+        #     {"phase": "start", "topic": self._topic},
+        #     context={"agent": "SupervisorAgent", "action": "self_commentary"},
+        # )
+        # self.logger.debug("self_commentary", extra={"sample": commentary[:200]})
 
         if self._last_n_ideas <= 0:
             raise RuntimeError("set_counts(hypotheses=...) must be positive")
-
+        print("before gen")
         # 1. Generation (RAG if vectordb linked)
         if self.gen:
             await self.gen.propose_hypotheses(self._last_n_ideas)
-
+        print("after gen")
         # 2. Reviews
         if self.rev_a:
             await self._review_with_fallback(self.rev_a, self.tournament)
+            print("after rev1")
         if self.rev_b:
             await self._review_with_fallback(self.rev_b, self.tournament)
+            print("after rev 2")
 
         # 3. Merge + push reviews
         merged = await self._collect_reviews()
+        print("merged")
         if merged:
             await self._push_reviews_to_tournament(merged)
+
 
         # 4. Tournament
         ok, _ = await _try_call_variants(self.tournament, "run_tournament", (((), {}),))
         if not ok:
             await _try_call_variants(self.tournament, "run", (((), {}),))
-
+        print("after tournament")
         # 5. Literature summarization (if wired)
         literature_summary: str | None = None
         if self.literature is not None:
@@ -322,7 +327,10 @@ class SupervisorAgent(Agent):
             ((leaderboard,), {}),
             ((), {}),
         )
-        await _try_call_variants(self.meta, "compute", meta_variants)
+        print("I am before meta var")
+        #await _try_call_variants(self.meta, "compute", meta_variants)
+        await self.meta.compute(leaderboard, literature_summary)
+        print("I am here after compute")
 
         # 7. Final report
         top_n = self._last_n_ideas if self._last_n_ideas > 0 else None

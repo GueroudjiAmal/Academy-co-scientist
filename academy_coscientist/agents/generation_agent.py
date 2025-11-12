@@ -100,11 +100,8 @@ class HypothesisGenerationAgent(Agent):
                 },
             )
 
-        def _thread_entry():
-            return asyncio.run(_run_llm())
-
         try:
-            ideas = await asyncio.to_thread(_thread_entry)
+            ideas = await _run_llm()
         except Exception as e:
             self.logger.exception(
                 "brainstorm_failed",

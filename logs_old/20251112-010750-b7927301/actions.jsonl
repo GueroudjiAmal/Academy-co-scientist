@@ -1,0 +1,4 @@
+{"ts": "2025-11-12T01:08:06Z", "run_id": "20251112-010750-b7927301", "type": "action", "logger": "LiteratureAgent", "action": "set_topic", "input": {"topic": "HPC workflow provenance"}, "output": {"ok": true}}
+{"ts": "2025-11-12T01:08:06Z", "run_id": "20251112-010750-b7927301", "type": "action", "logger": "LiteratureAgent", "action": "set_vector_agent", "input": {"vector_agent": "Handle<agent: AgentId<ee996974>>"}, "output": {"ok": true}}
+{"ts": "2025-11-12T01:08:31Z", "run_id": "20251112-010750-b7927301", "type": "action", "logger": "LiteratureAgent", "action": "vector_query_ok", "input": {"topic": "HPC workflow provenance", "k": 3}, "output": {"matches": 3}}
+{"ts": "2025-11-12T01:08:36Z", "run_id": "20251112-010750-b7927301", "type": "action", "logger": "LiteratureAgent", "action": "literature_review_done", "input": {"topic": "HPC workflow provenance"}, "output": {"chars": 1117}}

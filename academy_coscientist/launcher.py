@@ -3,11 +3,15 @@
 from __future__ import annotations
 import argparse
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
 from typing import Optional
 
-from academy.exchange import LocalExchangeFactory
+
 from academy.manager import Manager
+from academy.logging import init_logging
+
 
 from academy_coscientist.agents.generation_agent import HypothesisGenerationAgent
 from academy_coscientist.agents.review_agent import ReviewAgent
@@ -21,6 +25,10 @@ from academy_coscientist.agents.literature_agent import LiteratureAgent
 from academy_coscientist.utils.config import load_config, get_launch_param, maybe_override
 from academy_coscientist.utils.utils_logging import init_run_context, make_struct_logger
 
+from globus_compute_sdk import Executor as GCExecutor
+from academy.exchange.cloud.client import HttpExchangeFactory
+
+EXCHANGE_ADDRESS = 'https://exchange.academy-agents.org'
 
 async def _run_with_manager(
     topic: str,
@@ -28,27 +36,56 @@ async def _run_with_manager(
     review_k: Optional[int],
 ) -> str:
     logger = make_struct_logger("launcher.manager")
+    if 'ACADEMY_TUTORIAL_ENDPOINT_l' in os.environ:
+        executor = GCExecutor(os.environ['ACADEMY_TUTORIAL_ENDPOINT_1'])
+
+    else:
+        mp_context = multiprocessing.get_context('spawn')
+        executor = ProcessPoolExecutor(
+            max_workers=32,
+            initializer=init_logging,
+            mp_context=mp_context,
+        )
 
     async with await Manager.from_exchange_factory(
-        factory=LocalExchangeFactory(),
-        executors=ThreadPoolExecutor(),
+    factory=HttpExchangeFactory(
+        EXCHANGE_ADDRESS,
+        auth_method='globus',
+    ),
+    executors=executor,
     ) as manager:
+    # async with await Manager.from_exchange_factory(
+    #     factory=LocalExchangeFactory(),
+    #     executors=ThreadPoolExecutor(),
+    # ) as manager:
+
+
         # --- Launch all agents ---
         vectordb = await manager.launch(ResearchVectorDBAgent)
+        await vectordb.ping()
         generation = await manager.launch(HypothesisGenerationAgent)
+        await generation.ping()
         reviewer1 = await manager.launch(ReviewAgent)
+        await reviewer1.ping()
         reviewer2 = await manager.launch(ReviewAgent)
+        await reviewer2.ping()
         tournament = await manager.launch(TournamentAgent)
         meta = await manager.launch(MetaReviewAgent)
+        await meta.ping()
         reporter = await manager.launch(ReportAgent)
+        await reporter.ping()
         literature = await manager.launch(LiteratureAgent)
+        await literature.ping()
         supervisor = await manager.launch(SupervisorAgent)
+        await supervisor.ping()
+
 
         # --- Wire them together ---
 
         # Topic & tournament for generator
         await generation.set_topic(topic)
         await generation.set_tournament(tournament)
+        await generation.set_vectordb(vectordb)
 
         # Reviewers know which tournament to use
         await reviewer1.set_tournament(tournament)
@@ -57,6 +94,9 @@ async def _run_with_manager(
         # Literature agent: topic + vector backend
         await literature.set_topic(topic)
         await literature.set_vector_agent(vectordb)
+
+        # Reporter needs tournament + meta handle
+        await reporter.set_handles(tournament, meta)
 
         # Supervisor orchestrates everything
         await supervisor.set_topic(topic)
@@ -72,14 +112,12 @@ async def _run_with_manager(
             literature, # new literature context handle
         )
 
-        # Reporter needs tournament + meta handle
-        await reporter.set_handles(tournament, meta)
 
         logger.info(
             "run_full_cycle_start",
             extra={"topic": topic, "n_hypotheses": n_hypotheses, "review_k": review_k},
         )
-
+        print("run full cycle")
         report = await supervisor.run_full_cycle()
 
         logger.info("run_full_cycle_done", extra={"report_len": len(report)})

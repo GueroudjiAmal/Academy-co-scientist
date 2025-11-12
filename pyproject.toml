@@ -20,7 +20,8 @@ classifiers = [
 
 # Runtime deps (keep minimal but sufficient for the pipeline)
 dependencies = [
-  "academy-py>=0.3.0",                   # provides 'academy' module in most builds
+  #"academy-py>=0.3.0",                   # provides 'academy' module in most builds
+  "academy-py @ git+https://github.com/academy-agents/academy.git@main",
   "pyyaml>=6.0.1",
   "openai>=1.40.0",
   "pypdf>=4.0.0",                        # <-- replace pypdf2 with pypdf (fixes import)
@@ -28,6 +29,7 @@ dependencies = [
   "sentence-transformers>=3.0.1",
   "tqdm>=4.66.4",
   "rich>=13.7.1",
+  "globus-compute-endpoint"
 ]
 
 [project.optional-dependencies]

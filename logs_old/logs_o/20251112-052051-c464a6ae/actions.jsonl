@@ -1,0 +1,1 @@
+{"ts": "2025-11-12T05:21:07Z", "run_id": "20251112-052051-c464a6ae", "type": "action", "logger": "ReviewAgent", "action": "set_tournament", "input": {"tournament": "Handle<agent: AgentId<294bbb52>>"}, "output": {"ok": true}}

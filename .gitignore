@@ -207,6 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 # Logs
-logs/
+logs*/
 embeddings/
 other/
