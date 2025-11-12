@@ -1,4 +1,0 @@
-{"ts": "2025-11-12T17:51:16Z", "run_id": "20251112-175059-c85a769a", "type": "action", "logger": "ReviewAgent", "action": "set_tournament", "input": {"tournament": "Handle<agent: AgentId<b5198f47>>"}, "output": {"ok": true}}
-{"ts": "2025-11-12T17:51:32Z", "run_id": "20251112-175059-c85a769a", "type": "action", "logger": "ReviewAgent", "action": "review_single", "input": {"hypothesis_id": "h_1", "title": "Hypothesis 1", "desc_len": 1635, "retrieved_k": 0}, "output": {"score": 0.6, "confidence": 0.5, "recommendation": "revise"}}
-{"ts": "2025-11-12T17:51:32Z", "run_id": "20251112-175059-c85a769a", "type": "action", "logger": "ReviewAgent", "action": "review_all", "input": {"count": 1}, "output": {"reviewed": 1}}
-{"ts": "2025-11-12T17:51:32Z", "run_id": "20251112-175059-c85a769a", "type": "action", "logger": "ReviewAgent", "action": "get_reviews", "input": {"requested": true}, "output": {"count": 1}}

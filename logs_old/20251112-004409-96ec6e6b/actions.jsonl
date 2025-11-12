@@ -1,2 +1,0 @@
-{"ts": "2025-11-12T00:44:27Z", "run_id": "20251112-004409-96ec6e6b", "type": "action", "logger": "LiteratureAgent", "action": "set_topic", "input": {"topic": "HPC workflow provenance"}, "output": {"ok": true}}
-{"ts": "2025-11-12T00:44:27Z", "run_id": "20251112-004409-96ec6e6b", "type": "action", "logger": "LiteratureAgent", "action": "set_vector_agent", "input": {"vector_agent": "Handle<agent: AgentId<036c637e>>"}, "output": {"ok": true}}

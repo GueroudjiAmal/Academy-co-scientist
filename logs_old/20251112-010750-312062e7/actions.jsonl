@@ -1,1 +1,0 @@
-{"ts": "2025-11-12T01:08:06Z", "run_id": "20251112-010750-312062e7", "type": "action", "logger": "ReportAgent", "action": "set_handles", "input": {"tournament": "Handle<agent: AgentId<33523ec9>>", "meta": "Handle<agent: AgentId<80383915>>"}, "output": {"ok": true}}

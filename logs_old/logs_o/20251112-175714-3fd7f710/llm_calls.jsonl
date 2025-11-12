@@ -1,4 +1,0 @@
-{"ts": "2025-11-12T17:57:30Z", "run_id": "20251112-175714-3fd7f710", "type": "embed_call_openai", "model": "text-embedding-3-small", "texts_sample": ["Reliable AI"], "num_texts": 1, "context": {}}
-{"ts": "2025-11-12T17:57:32Z", "run_id": "20251112-175714-3fd7f710", "type": "embed_result_openai", "model": "text-embedding-3-small", "num_vectors": 1, "dim": 1536, "context": {}}
-{"ts": "2025-11-12T17:57:44Z", "run_id": "20251112-175714-3fd7f710", "type": "embed_call_openai", "model": "text-embedding-3-small", "texts_sample": ["Reliable AI"], "num_texts": 1, "context": {}}
-{"ts": "2025-11-12T17:57:44Z", "run_id": "20251112-175714-3fd7f710", "type": "embed_result_openai", "model": "text-embedding-3-small", "num_vectors": 1, "dim": 1536, "context": {}}

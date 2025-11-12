@@ -1,4 +1,0 @@
-{"ts": "2025-11-12T18:08:11Z", "run_id": "20251112-180755-1a9a6643", "type": "action", "logger": "LiteratureAgent", "action": "set_topic", "input": {"topic": "Reliable AI"}, "output": {"ok": true}}
-{"ts": "2025-11-12T18:08:11Z", "run_id": "20251112-180755-1a9a6643", "type": "action", "logger": "LiteratureAgent", "action": "set_vector_agent", "input": {"vector_agent": "Handle<agent: AgentId<2a949295>>"}, "output": {"ok": true}}
-{"ts": "2025-11-12T18:08:33Z", "run_id": "20251112-180755-1a9a6643", "type": "action", "logger": "LiteratureAgent", "action": "vector_query_ok", "input": {"topic": "Reliable AI", "k": 3}, "output": {"matches": 3}}
-{"ts": "2025-11-12T18:08:42Z", "run_id": "20251112-180755-1a9a6643", "type": "action", "logger": "LiteratureAgent", "action": "literature_review_done", "input": {"topic": "Reliable AI"}, "output": {"chars": 1568}}
