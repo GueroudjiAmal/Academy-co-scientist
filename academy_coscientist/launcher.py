@@ -36,8 +36,9 @@ async def _run_with_manager(
     review_k: Optional[int],
 ) -> str:
     logger = make_struct_logger("launcher.manager")
-    if 'ACADEMY_TUTORIAL_ENDPOINT_l' in os.environ:
-        executor = GCExecutor(os.environ['ACADEMY_TUTORIAL_ENDPOINT_1'])
+    if 'ACADEMY_TUTORIAL_ENDPOINT' in os.environ:
+        executor = GCExecutor(os.environ['ACADEMY_TUTORIAL_ENDPOINT'])
+        print("Setting up globus")
 
     else:
         mp_context = multiprocessing.get_context('spawn')
@@ -79,7 +80,6 @@ async def _run_with_manager(
         supervisor = await manager.launch(SupervisorAgent)
         await supervisor.ping()
 
-
         # --- Wire them together ---
 
         # Topic & tournament for generator
@@ -117,7 +117,6 @@ async def _run_with_manager(
             "run_full_cycle_start",
             extra={"topic": topic, "n_hypotheses": n_hypotheses, "review_k": review_k},
         )
-        print("run full cycle")
         report = await supervisor.run_full_cycle()
 
         logger.info("run_full_cycle_done", extra={"report_len": len(report)})

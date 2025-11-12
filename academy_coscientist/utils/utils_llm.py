@@ -33,7 +33,6 @@ def _get_openai_client() -> AsyncOpenAI:
     """
     return AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-
 def _is_local_embedding_model(name: str) -> bool:
     return str(name).strip().lower().startswith("local-")
 

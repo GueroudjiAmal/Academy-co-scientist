@@ -57,7 +57,7 @@ class LiteratureAgent(Agent):
         """Generate a literature summary using retrieved vector context."""
         if not self.topic:
             raise ValueError("Topic not set. Call set_topic() first.")
-        print("in review with vec context")
+
         context_blocks: list[str] = []
         if self.vector_agent:
             try:
@@ -100,7 +100,6 @@ class LiteratureAgent(Agent):
             temperature=0.4,
             max_completion_tokens=800,
         )
-        print("Summary from the litterature:","\n", summary)
         self._summary_cache = summary
         log_action(
             self.logger,
