@@ -17,12 +17,57 @@ __all__ = [
     'log_action',
     'make_struct_logger',
     'record_llm_call',
+    'register_action_hook',
+    'unregister_action_hook',
+    'register_llm_hook',
+    'unregister_llm_hook',
 ]
+
+# ---------------------------------------------------------------------------
+# Plugin hooks — callables registered here are invoked after the built-in
+# JSONL logging so external plugins (e.g. FlowCept) can observe every event
+# without modifying agent code.
+# ---------------------------------------------------------------------------
+
+# Each element: callable(logger, action, input_payload, output_payload)
+_ACTION_HOOKS: list = []
+# Each element: callable(payload: dict)
+_LLM_HOOKS: list = []
+
+
+def register_action_hook(fn) -> None:
+    """Register a callable invoked after every log_action() call."""
+    if fn not in _ACTION_HOOKS:
+        _ACTION_HOOKS.append(fn)
+
+
+def unregister_action_hook(fn) -> None:
+    """Remove a previously registered action hook (no-op if not found)."""
+    try:
+        _ACTION_HOOKS.remove(fn)
+    except ValueError:
+        pass
+
+
+def register_llm_hook(fn) -> None:
+    """Register a callable invoked after every record_llm_call() call."""
+    if fn not in _LLM_HOOKS:
+        _LLM_HOOKS.append(fn)
+
+
+def unregister_llm_hook(fn) -> None:
+    """Remove a previously registered LLM hook (no-op if not found)."""
+    try:
+        _LLM_HOOKS.remove(fn)
+    except ValueError:
+        pass
 
 # -------------------- module-wide run context --------------------
 
 _LOGS_ROOT_ENV = 'ACADEMY_LOGS_DIR'
-_DEFAULT_LOGS_ROOT = 'logs'
+_DEFAULT_LOGS_ROOT = 'runs'
+_RUN_ID_ENV = 'ACADEMY_RUN_ID'
+_RUN_DIR_ENV = 'ACADEMY_RUN_DIR'
 
 _RUN_ID: str | None = None
 _RUN_DIR: str | None = None
@@ -74,12 +119,23 @@ def init_run_context() -> tuple[str, str]:
         # idempotent; return existing
         return _RUN_ID, _RUN_DIR
 
-    _LOGS_ROOT = os.environ.get(_LOGS_ROOT_ENV, _DEFAULT_LOGS_ROOT)
-    os.makedirs(_LOGS_ROOT, exist_ok=True)
-
-    _RUN_ID = f'{_timestamp()}-{_short_uid(8)}'
-    _RUN_DIR = os.path.join(_LOGS_ROOT, _RUN_ID)
-    os.makedirs(_RUN_DIR, exist_ok=True)
+    # Subprocess workers inherit these env vars from the main process so all
+    # agents log into the same run directory instead of creating their own.
+    env_run_id = os.environ.get(_RUN_ID_ENV)
+    env_run_dir = os.environ.get(_RUN_DIR_ENV)
+    if env_run_id and env_run_dir:
+        _RUN_ID = env_run_id
+        _RUN_DIR = env_run_dir
+        os.makedirs(_RUN_DIR, exist_ok=True)
+    else:
+        _LOGS_ROOT = os.environ.get(_LOGS_ROOT_ENV, _DEFAULT_LOGS_ROOT)
+        os.makedirs(_LOGS_ROOT, exist_ok=True)
+        _RUN_ID = f'{_timestamp()}-{_short_uid(8)}'
+        _RUN_DIR = os.path.join(_LOGS_ROOT, _RUN_ID)
+        os.makedirs(_RUN_DIR, exist_ok=True)
+        # Publish for any child processes spawned later
+        os.environ[_RUN_ID_ENV] = _RUN_ID
+        os.environ[_RUN_DIR_ENV] = _RUN_DIR
 
     # Configure root logger only once
     root = logging.getLogger()
@@ -182,6 +238,13 @@ def log_action(
         list(input_payload or {}),
         list(output_payload or {}),
     )
+    # Plugin hooks (e.g. FlowCept) — errors are swallowed so they never
+    # interrupt normal agent operation.
+    for _hook in _ACTION_HOOKS:
+        try:
+            _hook(logger, action, input_payload, output_payload)
+        except Exception:
+            pass
 
 
 def record_llm_call(payload: dict[str, Any], mirror_to: str | None = None) -> None:
@@ -190,3 +253,9 @@ def record_llm_call(payload: dict[str, Any], mirror_to: str | None = None) -> No
     """
     path = mirror_to or get_llm_audit_path()
     _append_jsonl(path, {'type': 'llm_call', **(payload or {})})
+    # Plugin hooks (e.g. FlowCept) — errors are swallowed.
+    for _hook in _LLM_HOOKS:
+        try:
+            _hook(payload or {})
+        except Exception:
+            pass

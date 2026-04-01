@@ -7,12 +7,12 @@ from typing import List, Dict, Any, Optional
 
 import faiss
 import numpy as np
-from pypdf import PdfReader
 
 from academy.agent import action, Agent
 from academy_coscientist.utils.utils_logging import make_struct_logger, log_action
 from academy_coscientist.utils.utils_llm import embed_texts
 from academy_coscientist.utils.config import get_model, get_path
+from academy_coscientist.utils.utils_papers import extract_pdf_sections, section_title_slug
 
 
 class ResearchVectorDBAgent(Agent):
@@ -91,88 +91,18 @@ class ResearchVectorDBAgent(Agent):
         return p
 
     # ----------------------------------------------------------------------
-    # PDF → Abstract extraction
+    # PDF → Section extraction
     # ----------------------------------------------------------------------
-
-    def _extract_abstract_from_pdf(self, pdf_path: Path) -> str:
-        """
-        Extract an abstract-like section from the beginning of a PDF using pypdf.
-
-        Heuristic:
-          - Concatenate text from first ~3 pages.
-          - Find the first occurrence of 'abstract'.
-          - Cut until 'introduction' or typical section-start markers.
-        """
-        try:
-            reader = PdfReader(str(pdf_path))
-        except Exception as e:
-            self.logger.error(
-                "pdf_open_failed",
-                extra={"file": str(pdf_path), "error": str(e)},
-            )
-            log_action(
-                self.logger,
-                "pdf_open_failed",
-                {"file": str(pdf_path)},
-                {"error": str(e)},
-            )
-            return ""
-
-        text_chunks: List[str] = []
-        for page in reader.pages[:3]:
-            try:
-                t = page.extract_text() or ""
-            except Exception as e:
-                self.logger.warning(
-                    "pdf_page_extract_failed",
-                    extra={"file": str(pdf_path), "error": str(e)},
-                )
-                log_action(
-                    self.logger,
-                    "pdf_page_extract_failed",
-                    {"file": str(pdf_path)},
-                    {"error": str(e)},
-                )
-                t = ""
-            if t:
-                text_chunks.append(t)
-
-        if not text_chunks:
-            return ""
-
-        full_text = "\n".join(text_chunks)
-        lower = full_text.lower()
-
-        start = -1
-        for token in ["\nabstract\n", "\nabstract:", "abstract\n", "abstract:"]:
-            start = lower.find(token)
-            if start != -1:
-                start += len(token)
-                break
-        if start == -1:
-            generic = lower.find("abstract")
-            if generic == -1:
-                return ""
-            start = generic + len("abstract")
-
-        end = len(full_text)
-        for marker in ["\nintroduction", "\n1 ", "\n1.", "\nI ", "\nI."]:
-            idx = lower.find(marker, start)
-            if idx != -1:
-                end = idx
-                break
-
-        abstract = full_text[start:end].strip()
-        if len(abstract) < 100:
-            return ""
-        if len(abstract) > 10000:
-            abstract = abstract[:10000]
-
-        return abstract
 
     def _prepare_abstracts_from_pdfs(self) -> None:
         """
-        Extract abstracts from all PDFs into self.abstracts_dir as .txt files.
+        Extract body sections from all PDFs in ``pdf_dir`` and write one
+        ``.txt`` file per section into ``abstracts_dir``.
+
+        File naming: ``{pdf_stem}___{section_slug}.txt``
+
+        Sections before the abstract (authors, affiliations) and the
+        bibliography/references section are automatically skipped.
         """
         self.abstracts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -187,28 +117,43 @@ class ResearchVectorDBAgent(Agent):
             return
 
         pdf_files = sorted(self.pdf_dir.glob("*.pdf"))
-        print(f"📄 Found {len(pdf_files)} PDFs in {self.pdf_dir}")
+        print(f"[VectorDB] Found {len(pdf_files)} PDFs in {self.pdf_dir}")
 
-        extracted = 0
+        total_sections = 0
         skipped = 0
 
         for pdf_path in pdf_files:
-            abstract_text = self._extract_abstract_from_pdf(pdf_path)
-            if not abstract_text:
-                print(f"⚠️ No abstract found in {pdf_path.name}")
+            try:
+                sections = extract_pdf_sections(str(pdf_path))
+            except Exception as e:
+                self.logger.warning(
+                    "pdf_section_extract_failed",
+                    extra={"file": str(pdf_path), "error": str(e)},
+                )
                 skipped += 1
                 continue
 
-            out_path = self.abstracts_dir / f"{pdf_path.stem}.txt"
-            out_path.write_text(abstract_text, encoding="utf-8")
-            print(f"✅ Extracted abstract: {out_path.name}")
-            extracted += 1
+            if not sections:
+                print(f"[VectorDB] No sections extracted from {pdf_path.name}")
+                skipped += 1
+                continue
+
+            for sec in sections:
+                slug = section_title_slug(sec["title"])
+                out_path = self.abstracts_dir / f"{pdf_path.stem}___{slug}.txt"
+                header = f"Paper: {pdf_path.stem}\nSection: {sec['title']}\n\n"
+                out_path.write_text(header + sec["text"], encoding="utf-8")
+                total_sections += 1
+
+            print(
+                f"[VectorDB] {pdf_path.name}: {len(sections)} sections extracted"
+            )
 
         log_action(
             self.logger,
-            "abstracts_extracted",
+            "sections_extracted",
             {"pdf_dir": str(self.pdf_dir)},
-            {"extracted": extracted, "skipped": skipped},
+            {"total_sections": total_sections, "skipped_pdfs": skipped},
         )
 
     # ----------------------------------------------------------------------
@@ -318,7 +263,21 @@ class ResearchVectorDBAgent(Agent):
             if not content:
                 continue
             abstracts.append(content)
-            metas.append({"file": txt_path.name})
+            # Parse section and paper name from filename convention
+            # New format: {paper_base}___{section_slug}.txt
+            # Old format: {paper_base}.txt
+            fname = txt_path.name
+            if "___" in fname:
+                paper_part, sec_part = fname.rsplit("___", 1)
+                section = sec_part.removesuffix(".txt").replace("_", " ")
+            else:
+                paper_part = fname.removesuffix(".txt")
+                section = "Abstract"
+            metas.append({
+                "file":    fname,
+                "paper":   paper_part,
+                "section": section,
+            })
 
         if not abstracts:
             self.logger.warning(
@@ -334,7 +293,7 @@ class ResearchVectorDBAgent(Agent):
             print(f"⚠️ No abstract .txt files found in {self.abstracts_dir}")
             return
 
-        print(f"✏️ Embedding {len(abstracts)} abstracts using {self.embedding_model}...")
+        print(f"[VectorDB] Embedding {len(abstracts)} sections using {self.embedding_model}...")
         log_action(
             self.logger,
             "rebuild_index_start",
@@ -388,12 +347,38 @@ class ResearchVectorDBAgent(Agent):
             {"docs": len(metas), "ok": True},
         )
 
-        print(f"🎯 FAISS index built with {len(metas)} docs, dim={dim}")
-        print(f"💾 Saved index, metadata, and embeddings to {self.embeddings_dir}")
+        print(f"[VectorDB] FAISS index built with {len(metas)} sections, dim={dim}")
+        print(f"[VectorDB] Saved index, metadata, and embeddings to {self.embeddings_dir}")
 
     # ----------------------------------------------------------------------
     # Query
     # ----------------------------------------------------------------------
+
+    @action
+    async def query_texts(self, query_text: str, k: int = 5) -> List[str]:
+        """
+        Like query() but returns the actual abstract text content instead of
+        file-name metadata.  Useful for agents that need to read the abstracts
+        directly for RAG context.
+        """
+        results = await self.query(query_text, k=k)
+        texts: List[str] = []
+        for meta in results:
+            fname = meta.get("file", "")
+            if not fname:
+                continue
+            txt_path = self.abstracts_dir / fname
+            try:
+                if txt_path.exists():
+                    content = txt_path.read_text(encoding="utf-8").strip()
+                    if content:
+                        texts.append(content)
+            except Exception as e:
+                self.logger.warning(
+                    "query_texts_read_error",
+                    extra={"file": fname, "error": repr(e)},
+                )
+        return texts
 
     @action
     async def query(self, query_text: str, k: int = 5) -> List[Dict[str, Any]]:
