@@ -129,9 +129,11 @@ simulator:
   # ---- Executor ----
   # "thread"  — ThreadPoolExecutor (default; safest for local dev)
   # "process" — ProcessPoolExecutor (true parallelism; requires picklable agents)
+  # "globus"  — Globus Compute (run agents on a remote HPC endpoint)
   executor:
     type: process
     max_workers: 16
+    # endpoint_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # required when type: globus
 
 # -----------------------------------------------------------
 # Proof-of-concept agent
@@ -213,22 +215,32 @@ report:
 # -----------------------------------------------------------
 # LLM model configuration
 # -----------------------------------------------------------
-argo_mode: true                         # Route ALL LLM calls through the Argo gateway
-argo_user: "agueroudji"                       # ANL username (or set ARGO_USER env var)
+argo_mode: false                        # Use direct OpenAI / Anthropic APIs
+# argo_user: "agueroudji"             # Uncomment to re-enable Argo routing
+# argo_fallback: true                 # Retry via direct API when Argo fails (needs API keys)
 
 models:
-  # --- Per-agent-type models (one knob per agent) ---
-  generation:    "gpt5"                # HypothesisGenerationAgent — brainstorming
-  review:        "gpt52"                # ReviewAgent — scoring and critique
-  refinement:    "gpt54"                # HypothesisRefinerAgent — refining
-  poc_codegen:   "claudeopus46"         # PoC code generation
-  poc_fix:       "claudeopus46"         # PoC code fixing
-  poc_interpret: "claudeopus46"         # PoC result interpretation
-  report:        "gemini25pro"          # PDF report narratives
-  commentary:    "gpt52"               # Agent self-commentary (all agents)
+  # --- Generic roles (fallback when no per-agent key matches) ---
+  reasoning:     "o4-mini"                 # Default reasoning model (structured thinking)
+  writing:       "gpt-4o"                  # Default writing / prose model
+
+  # --- Per-agent-type models ---
+  generation:    "o4-mini"                 # HypothesisGenerationAgent — brainstorming
+  review:        "o4-mini"                 # ReviewAgent — scoring and critique
+  refinement:    "o4-mini"                 # HypothesisRefinerAgent — improving
+
+  # PoC pipeline (Claude Opus for code, Sonnet for interpretation)
+  poc:           "claude-opus-4-6"         # Default for all PoC tasks
+  poc_codegen:   "claude-opus-4-6"         # PoC code generation
+  poc_fix:       "claude-opus-4-6"         # PoC code fixing
+  poc_interpret: "claude-sonnet-4-6"       # PoC result interpretation
+
+  # Report + commentary
+  report:        "claude-sonnet-4-6"       # PDF report narratives
+  commentary:    "gpt-4o-mini"             # Keyword extraction, self-commentary
+
   # --- Infrastructure ---
-  embedding:     "local-all-MiniLM-L6-v2"  # Local FAISS (no API key needed)
-  argo:          "gpt54"               # Default for call_argo_llm() if no role matches
+  embedding:     "local-all-MiniLM-L6-v2" # Local FAISS (no API key needed)
 
 # Temperature per agent type.
 temperatures:

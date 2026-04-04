@@ -128,10 +128,10 @@ def _build_exchange(sim_cfg: dict):
 #         print(f"[worker] Flowcept subprocess init failed: {_e!r}", flush=True)
 
 
-def _build_executor(sim_cfg: dict):
-    """Return a concurrent.futures executor based on config."""
-    exec_type = _get(sim_cfg, "executor", "type", default="thread")
-    max_workers = _get(sim_cfg, "executor", "max_workers", default=16)
+def _build_single_executor(cfg: dict):
+    """Build one executor from a flat executor-config dict."""
+    exec_type = str(cfg.get("type", "thread")).lower()
+    max_workers = int(cfg.get("max_workers", 16))
     if exec_type == "process":
         mp_context = multiprocessing.get_context("spawn")
         return ProcessPoolExecutor(
@@ -139,8 +139,72 @@ def _build_executor(sim_cfg: dict):
             # initializer=_worker_init,
             mp_context=mp_context,
         )
+    elif exec_type == "globus":
+        from globus_compute_sdk import Executor as GlobusComputeExecutor
+        endpoint_id = cfg.get("endpoint_id")
+        if not endpoint_id:
+            raise RuntimeError(
+                "endpoint_id is required for a globus executor. "
+                "Set it under the executor entry in your config."
+            )
+        user_endpoint_config = cfg.get("user_endpoint_config") or {}
+        return GlobusComputeExecutor(
+            endpoint_id=endpoint_id,
+            user_endpoint_config=user_endpoint_config or None,
+        )
+    elif exec_type in ("local", "event_loop"):
+        # None tells Academy Manager to run the agent in the event loop
+        return None
     else:
         return ThreadPoolExecutor(max_workers=max_workers)
+
+
+def _build_executor(sim_cfg: dict):
+    """
+    Return ``(executors, default_executor_name)`` for the Academy Manager.
+
+    Three modes driven by ``executor.type`` in config:
+
+    * ``"thread"`` / ``"process"`` / ``"globus"`` — single executor returned as
+      a plain object; Academy wraps it as ``{"default": executor}`` internally.
+      Returns ``(executor, None)`` so the caller passes it directly.
+
+    * ``"federated"`` — returns a named dict and the default executor name so
+      the caller can pass ``executor="aurora"`` on individual ``manager.launch()``
+      calls to pin specific agents to specific endpoints.
+      Config shape::
+
+          executor:
+            type: federated
+            default: "local"
+            executors:
+              local:
+                type: thread
+                max_workers: 16
+              aurora:
+                type: globus
+                endpoint_id: "xxxx-..."
+    """
+    exec_type = _get(sim_cfg, "executor", "type", default="thread")
+
+    if exec_type == "federated":
+        named_cfgs = _get(sim_cfg, "executor", "executors", default={}) or {}
+        default_name = str(_get(sim_cfg, "executor", "default", default="local"))
+        executors: dict = {}
+        for name, cfg in named_cfgs.items():
+            executors[name] = _build_single_executor(cfg or {})
+        if not executors:
+            raise RuntimeError("executor.type=federated requires at least one entry under executor.executors")
+        if default_name not in executors:
+            raise RuntimeError(
+                f"executor.default={default_name!r} is not among the defined executors: "
+                + ", ".join(executors)
+            )
+        return executors, default_name
+
+    # Single executor — return as-is; Manager wraps it under "default" key.
+    single = _build_single_executor(_get(sim_cfg, "executor", default={}) or {})
+    return single, None
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +292,7 @@ async def _launch_harvester_agents(
     topics: list[str],
     vectordb,
     stagger: float,
+    remote_exec: str | None = None,
 ) -> list:
     """
     Launch PaperHarvesterAgent instances.
@@ -256,6 +321,7 @@ async def _launch_harvester_agents(
         topic_slice = topics[i * chunk: (i + 1) * chunk] or topics
         delay = start_delay + float(i) * stagger
 
+        launch_kw = {"executor": remote_exec} if remote_exec else {}
         agent = await manager.launch(
             PaperHarvesterAgent,
             args=(
@@ -268,6 +334,7 @@ async def _launch_harvester_agents(
                 loop_interval,
                 delay,
             ),
+            **launch_kw,
         )
         await agent.ping(timeout=30.0)
         if vectordb:
@@ -451,26 +518,25 @@ async def _launch_teams(
     poc_top_n = int(_get(poc_cfg, "top_n", default=3))
     poc_max_retries = int(_get(poc_cfg, "max_retries", default=3))
 
-    # --- Docker executor ---
+    # --- Docker executor for PoC code execution ---
+    code_timeout   = int(_get(poc_cfg, "code_timeout", default=90))
     docker_image   = str(_get(poc_cfg, "docker_image",   default="python:3.11-slim"))
-    docker_timeout = int(_get(poc_cfg, "code_timeout",   default=90))
     docker_memory  = str(_get(poc_cfg, "docker_memory",  default="512m"))
     docker_network = str(_get(poc_cfg, "docker_network", default="none"))
 
     docker_agent = await manager.launch(
         DockerExecutorAgent,
-        args=(docker_image, docker_timeout, docker_memory, docker_network),
+        args=(docker_image, code_timeout, docker_memory, docker_network),
     )
+    _executor_label = f"DockerExecutorAgent (image={docker_image!r})"
+
     try:
         await docker_agent.ping(timeout=30.0)
     except Exception as ping_err:
-        print(f"[simulator] WARNING: DockerExecutorAgent ping failed ({ping_err!r})", flush=True)
+        print(f"[simulator] WARNING: {_executor_label} ping failed ({ping_err!r})", flush=True)
         docker_agent = None
     else:
-        logger.info(
-            "Launched DockerExecutorAgent (image=%r, timeout=%ds, mem=%s, network=%s)",
-            docker_image, docker_timeout, docker_memory, docker_network,
-        )
+        logger.info("Launched %s (timeout=%ds)", _executor_label, code_timeout)
         if docker_agent:
             all_agents.append(docker_agent)
 
@@ -488,9 +554,6 @@ async def _launch_teams(
     await poc_agent.set_topic(topics[0])
     if docker_agent is not None:
         await poc_agent.set_executor(docker_agent)
-        await poc_agent.set_docker_config(
-            docker_image, docker_network, docker_memory, docker_timeout
-        )
     # Register all team coordinators so the PoC agent polls them for completion
     # instead of relying solely on a fixed time delay.
     for coord in coordinators:
@@ -688,7 +751,13 @@ def _print_startup_diagnostics(cfg: dict) -> None:
     print("=" * 64 + "\n", flush=True)
 
 
-async def _run_simulator(cfg: dict) -> None:
+async def _run_simulator(
+    cfg: dict,
+    exchange,
+    executor_obj,
+    default_exec: str | None,
+    remote_exec: str | None,
+) -> None:
     _print_startup_diagnostics(cfg)
 
     sim_cfg = cfg.get("simulator", {})
@@ -703,37 +772,24 @@ async def _run_simulator(cfg: dict) -> None:
     struct_logger = make_struct_logger("simulator")
     struct_logger.info("simulator_start", extra={"topics": topics, "config": sim_cfg})
 
-    # # If Flowcept is active, publish its workflow/campaign IDs via env vars so
-    # # that process executor workers can re-apply the Runtime patches against
-    # # the same workflow (see _worker_init).
-    # try:
-    #     import flowcept.agents.academy.academy_plugin as _ap_mod
-    #     _fc = _ap_mod._ACTIVE_INTERCEPTOR
-    #     if _fc is not None and _fc._workflow_id:
-    #         os.environ["FLOWCEPT_WORKFLOW_ID"] = _fc._workflow_id
-    #         os.environ["FLOWCEPT_CAMPAIGN_ID"] = _fc._campaign_id or ""
-    # except Exception:
-    #     pass
+    manager_kwargs: dict = {"factory": exchange, "executors": executor_obj}
+    if default_exec is not None:
+        manager_kwargs["default_executor"] = default_exec
 
-    exchange = _build_exchange(sim_cfg)
-    executor = _build_executor(sim_cfg)
-
-    async with await Manager.from_exchange_factory(
-        factory=exchange,
-        executors=executor,
-    ) as manager:
+    async with await Manager.from_exchange_factory(**manager_kwargs) as manager:
         # --- Vector DB (optional, shared) ---
         vectordb = None
         if use_vectordb:
-            vectordb = await manager.launch(ResearchVectorDBAgent)
+            launch_kw = {"executor": remote_exec} if remote_exec else {}
+            vectordb = await manager.launch(ResearchVectorDBAgent, **launch_kw)
             await vectordb.ping(timeout=30.0)
-            logger.info("Launched ResearchVectorDBAgent")
+            logger.info("Launched ResearchVectorDBAgent (executor=%r)", remote_exec or "default")
 
         # --- Paper harvester (weekly, feeds vector DB) ---
         # Launched before generation agents so the first harvest can populate
         # the vector store before hypothesis generation starts.
         harv_agents = await _launch_harvester_agents(
-            manager, sim_cfg, topics, vectordb, stagger
+            manager, sim_cfg, topics, vectordb, stagger, remote_exec=remote_exec
         )
 
         # --- Global tournament (shared destination for validated hypotheses) ---
@@ -965,6 +1021,17 @@ def main() -> None:
 
     print(f"[simulator] Run directory: {run_dir}", flush=True)
 
+    # Build exchange and executors here (before asyncio.run) so that any
+    # blocking I/O — especially GlobusComputeExecutor's OAuth + AMQP init —
+    # happens in the main thread rather than inside the event loop.
+    sim_cfg = cfg.get("simulator", {})
+    exchange = _build_exchange(sim_cfg)
+    executor_obj, default_exec = _build_executor(sim_cfg)
+    remote_exec = _get(sim_cfg, "executor", "remote", default=None)
+
+    def _run():
+        asyncio.run(_run_simulator(cfg, exchange, executor_obj, default_exec, remote_exec))
+
     # FlowCept provenance — driven by ~/.flowcept/settings.yaml (plugins.academy section).
     # When flowcept.enabled is true in the simulator config we wrap with Flowcept()
     # so the academy plugin auto-starts/stops; otherwise we run without provenance.
@@ -981,12 +1048,12 @@ def main() -> None:
         from flowcept import Flowcept
         with Flowcept():
             try:
-                asyncio.run(_run_simulator(cfg))
+                _run()
             except KeyboardInterrupt:
                 pass
     else:
         try:
-            asyncio.run(_run_simulator(cfg))
+            _run()
         except KeyboardInterrupt:
             pass
 

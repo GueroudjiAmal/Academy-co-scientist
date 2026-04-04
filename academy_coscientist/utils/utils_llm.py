@@ -68,6 +68,25 @@ def _get_anthropic_client():
 
 _ARGO_DEFAULT_URL = "https://apps-dev.inside.anl.gov/argoapi/api/v1/resource/chat/"
 
+# Maps Argo model names → direct OpenAI / Anthropic model IDs used when
+# argo_mode is true but the Argo call fails and argo_fallback is enabled.
+_ARGO_TO_DIRECT_MODEL: dict[str, str] = {
+    "gpt4o":          "gpt-4o",
+    "gpt4o-mini":     "gpt-4o-mini",
+    "gpt4":           "gpt-4",
+    "gpt41":          "gpt-4.1",
+    "gpt41mini":      "gpt-4.1-mini",
+    "gpt52":          "gpt-4o",
+    "gpt54":          "gpt-4o",
+    "gpt5":           "gpt-4o",
+    "o4mini":         "o4-mini",
+    "claudeopus46":   "claude-opus-4-6",
+    "claudesonnet46": "claude-sonnet-4-6",
+    "claudehaiku45":  "claude-haiku-4-5-20251001",
+    "gemini25pro":    "claude-sonnet-4-6",   # no direct Gemini; fallback to Claude
+    "llama3":         "gpt-4o-mini",         # no direct llama; fallback to OpenAI
+}
+
 
 def _get_argo_user() -> str:
     user = os.environ.get("ARGO_USER", "") or get_config().get("argo_user", "")
@@ -321,9 +340,8 @@ async def _chat_completion(
     ctx = ctx or {}
     audit_path = ctx.get("audit_path", get_llm_audit_path())
 
-    allow_temperature = True
-    if model in {"o4-mini"}:
-        allow_temperature = False
+    _NO_TEMPERATURE_MODELS = {"o1", "o1-mini", "o3", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini"}
+    allow_temperature = model not in _NO_TEMPERATURE_MODELS
 
     temperature_value = temperature if allow_temperature else None
 
@@ -372,6 +390,80 @@ async def _chat_completion(
         raise RuntimeError(f"OpenAI chat completion error (model={model!r}): {e}") from None
 
 
+def _is_anthropic_model(name: str) -> bool:
+    return str(name).strip().lower().startswith("claude-")
+
+
+def _resolve_fallback_model(argo_model: str) -> str:
+    """
+    Resolve a direct OpenAI/Anthropic model name to use when Argo is unavailable.
+
+    Priority:
+    1. ``fallback_models.<argo_model>`` in config  (explicit per-model override)
+    2. ``_ARGO_TO_DIRECT_MODEL`` table             (built-in mapping)
+    3. ``fallback_models.default`` in config       (catch-all override)
+    4. ``"gpt-4o"``                                (hard-coded last resort)
+    """
+    cfg_fallbacks: dict = get_config().get("fallback_models", {}) or {}
+    if argo_model in cfg_fallbacks:
+        return str(cfg_fallbacks[argo_model])
+    if argo_model in _ARGO_TO_DIRECT_MODEL:
+        return _ARGO_TO_DIRECT_MODEL[argo_model]
+    if "default" in cfg_fallbacks:
+        return str(cfg_fallbacks["default"])
+    return "gpt-4o"
+
+
+async def _dispatch_chat(
+    system: str,
+    user: str,
+    model: str,
+    temperature: float | None,
+    ctx: dict[str, Any] | None,
+    max_tokens: int | None = None,
+) -> str:
+    """Route a chat request to Argo, Anthropic, or OpenAI based on active config and model name."""
+    if _use_argo():
+        try:
+            return await call_argo_llm(
+                system=system,
+                user=user,
+                model=model,
+                temperature=temperature if temperature is not None else 0.1,
+                ctx=ctx,
+            )
+        except Exception as argo_err:
+            if not get_config().get("argo_fallback", False):
+                raise
+            fallback_model = _resolve_fallback_model(model)
+            _logger.warning(
+                "Argo call failed (model=%r), falling back to direct API (fallback=%r): %s",
+                model, fallback_model, argo_err,
+            )
+            model = fallback_model  # fall through to direct-API dispatch below
+
+    if _is_anthropic_model(model):
+        return await call_claude_llm(
+            system=system,
+            user=user,
+            model=model,
+            temperature=temperature if temperature is not None else 1.0,
+            max_tokens=max_tokens or 8192,
+            ctx=ctx,
+        )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    return await _chat_completion(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_completion_tokens=max_tokens,
+        ctx=ctx,
+    )
+
+
 async def call_reasoning_llm(
     system: str,
     user: str,
@@ -380,25 +472,14 @@ async def call_reasoning_llm(
     temperature: float | None = None,
     model: str | None = None,
 ) -> str:
-    if _use_argo():
-        return await call_argo_llm(
-            system=system,
-            user=user,
-            model=model or get_model("reasoning"),
-            temperature=temperature if temperature is not None else 0.1,
-            ctx=ctx,
-        )
-    model = get_model("reasoning")
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-    return await _chat_completion(
-        model=model,
-        messages=messages,
-        temperature=None,
-        max_completion_tokens=max_completion_tokens,
+    _model = model or get_model("reasoning")
+    return await _dispatch_chat(
+        system=system,
+        user=user,
+        model=_model,
+        temperature=temperature,
         ctx=ctx,
+        max_tokens=max_completion_tokens,
     )
 
 
@@ -413,25 +494,13 @@ async def call_writing_llm(
     if temperature is None:
         temperature = get_temperature("writing")
     _model = model or get_model("writing")
-    if _use_argo():
-        return await call_argo_llm(
-            system=system,
-            user=user,
-            model=_model,
-            temperature=temperature or 0.7,
-            ctx=ctx,
-        )
-    model = _model
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-    return await _chat_completion(
-        model=model,
-        messages=messages,
+    return await _dispatch_chat(
+        system=system,
+        user=user,
+        model=_model,
         temperature=temperature,
-        max_completion_tokens=max_completion_tokens,
         ctx=ctx,
+        max_tokens=max_completion_tokens,
     )
 
 
@@ -654,52 +723,24 @@ async def _call_llm_json(
         "context": ctx,
     }
 
-    if _use_argo():
-        try:
-            llm_text = await call_argo_llm(
-                system=messages[0]["content"],
-                user=messages[1]["content"],
-                model=reasoning_model,
-                temperature=_temperature,
-                ctx=ctx,
-            )
-            llm_record["model_used"] = reasoning_model
-            llm_record["finish_reason"] = "stop"
-        except Exception as e:
-            llm_record["error"] = repr(e)
-            record_llm_call(llm_record, mirror_to=audit_path)
-            _logger.error(
-                "JSON LLM call (Argo) failed",
-                extra={"error": repr(e), "model": reasoning_model},
-            )
-            raise
-    else:
-        try:
-            client = _get_openai_client()
-            resp = await client.chat.completions.create(
-                model=reasoning_model,
-                messages=messages,
-            )
-            llm_text = resp.choices[0].message.content or ""
-            llm_record["raw_response"] = _to_safe_json(resp)
-            llm_record["model_used"] = getattr(resp, "model", reasoning_model)
-            llm_record["finish_reason"] = (
-                resp.choices[0].finish_reason if resp.choices else None
-            )
-            if resp.usage:
-                llm_record["usage"] = {
-                    "prompt_tokens": resp.usage.prompt_tokens,
-                    "completion_tokens": resp.usage.completion_tokens,
-                    "total_tokens": resp.usage.total_tokens,
-                }
-        except (APIStatusError, RateLimitError) as e:
-            llm_record["error"] = repr(e)
-            record_llm_call(llm_record, mirror_to=audit_path)
-            _logger.error(
-                "JSON LLM call failed",
-                extra={"error": repr(e), "model": reasoning_model},
-            )
-            raise RuntimeError(f"OpenAI JSON call error (model={reasoning_model!r}): {e}") from None
+    try:
+        llm_text = await _dispatch_chat(
+            system=messages[0]["content"],
+            user=messages[1]["content"],
+            model=reasoning_model,
+            temperature=_temperature,
+            ctx=ctx,
+        )
+        llm_record["model_used"] = reasoning_model
+        llm_record["finish_reason"] = "stop"
+    except Exception as e:
+        llm_record["error"] = repr(e)
+        record_llm_call(llm_record, mirror_to=audit_path)
+        _logger.error(
+            "JSON LLM call failed",
+            extra={"error": repr(e), "model": reasoning_model},
+        )
+        raise
 
     parsed: Any = {}
     fallback_used = False

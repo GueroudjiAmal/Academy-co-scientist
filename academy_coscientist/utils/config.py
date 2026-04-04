@@ -40,23 +40,23 @@ def get_model(role: str, default: str | None = None) -> str:
         return str(models[role])
     # sensible fallbacks if not configured
     defaults = {
-        # per-agent-type keys (preferred)
-        'generation':    "gpt4o",
-        'review':        "gpt4o",
-        'refinement':    "gpt4o",
-        'poc_codegen':   "claudeopus46",
-        'poc_fix':       "claudeopus46",
-        'poc_interpret': "claudeopus46",
-        'report':        "claudeopus46",
-        'commentary':    "gpt4o",
         # generic fallbacks
-        'reasoning':     "gpt4o",
-        'writing':       "gpt4o",
-        'embedding':     'text-embedding-3-small',
-        'poc':           "claudeopus46",
-        'argo':          "gpt4o",
+        'reasoning':     "o4-mini",
+        'writing':       "gpt-4o",
+        # per-agent-type keys
+        'generation':    "o4-mini",
+        'review':        "o4-mini",
+        'refinement':    "o4-mini",
+        'poc':           "claude-opus-4-6",
+        'poc_codegen':   "claude-opus-4-6",
+        'poc_fix':       "claude-opus-4-6",
+        'poc_interpret': "claude-sonnet-4-6",
+        'report':        "claude-sonnet-4-6",
+        'commentary':    "gpt-4o-mini",
+        'embedding':     "local-all-MiniLM-L6-v2",
+        'argo':          "gpt-4o",
     }
-    return default or defaults.get(role, 'gpt-5o-mini')
+    return default or defaults.get(role, 'gpt-4o-mini')
 
 
 def get_temperature(role: str, default: float | None = None) -> float | None:

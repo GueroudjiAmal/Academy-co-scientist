@@ -1,0 +1,180 @@
+# ============================================================
+# Academy Co-Scientist — Aurora (ANL) Configuration
+# ============================================================
+#
+# Designed for running inside a PBS job on Aurora at Argonne
+# National Laboratory.  Key differences from simulator_config.yaml:
+#
+#   • LLM calls routed through the ANL Argo gateway (internal network)
+#   • PoC code executed via Docker
+#   • Paths anchored to the Lustre filesystem (/lus/flare/...)
+#   • Paper harvester disabled by default (compute nodes have no internet)
+#   • Flowcept provenance written to the Lustre scratch space
+#
+# PBS job script snippet
+# ----------------------
+#   #PBS -l select=1:ncpus=208:ngpus=12
+#   #PBS -l walltime=02:00:00
+#   #PBS -q prod
+#   module load docker  # or use the site-provided container runtime
+#   cd /lus/flare/projects/<project>/<user>/academy-coscientist
+#   export OPENAI_API_KEY=...          # not needed when argo_mode: true
+#   export ARGO_USER=agueroudji
+#   python -m academy_coscientist.simulator --config configs/aurora_config.yaml
+# ============================================================
+
+simulator:
+
+  topics:
+    - "Explore the intersection of vector databases and knowledge graph for HPC readiness of AI memory"
+
+  teams:
+    count: 2
+    reviewers_per_team: 2
+    hypotheses_per_cycle: 3
+    score_threshold: 0.6
+    min_pass_score: 0.50
+    max_refinement_rounds: 5
+    interval: 60.0
+    max_cycles: 2
+
+  agents:
+    generation:  2
+    review:      3
+    tournament:  1
+    vectordb:    1
+    harvester:   0      # disabled — compute nodes have no internet access
+
+  intervals:
+    generation:  60
+    review:      45
+    tournament:  30
+
+  hypotheses_per_cycle: 3
+  rag_top_k: 5
+
+  harvester:
+    papers_per_topic: 50
+    min_citation_count: 0
+    download_pdfs: false          # no internet on Aurora compute nodes
+    loop_interval: 604800
+    loop_start_delay: 0
+
+  stagger_delay: 5.0
+  status_interval_seconds: 60.0
+  max_duration_seconds: null
+
+  # ---- Exchange ----
+  # Use local exchange for intra-job (single-node) runs.
+  # Switch to redis if Redis is started as part of the PBS job:
+  #   redis-server --daemonize yes --port 6379
+  exchange:
+    type: local
+    # type: redis
+    # redis_host: "localhost"
+    # redis_port: 6379
+
+  # ---- Executor ----
+  # process: spawn workers on the same compute node (recommended for Aurora)
+  # globus:  dispatch to a Globus Compute endpoint (for multi-node or remote)
+  executor:
+    type: process
+    max_workers: 16
+    # type: globus
+    # endpoint_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # Aurora endpoint UUID
+
+# -----------------------------------------------------------
+# Proof-of-concept agent (Docker)
+# -----------------------------------------------------------
+poc:
+  enabled: true
+  top_n: 3
+  max_retries: 1
+
+  # null → auto-set to <run_dir>/poc_results
+  output_dir: null
+
+  # ---- Docker execution sandbox ----
+  # Build the image once before running:
+  #   docker build -t academy-poc-runner docker/
+  docker_image:   "academy-poc-runner"
+  code_timeout:   120              # slightly longer budget for HPC workloads
+  docker_memory:  "512m"
+  docker_network: "none"
+
+# -----------------------------------------------------------
+# FlowCept provenance
+# -----------------------------------------------------------
+flowcept:
+  enabled: true
+  workflow_name: "academy-coscientist-aurora"
+  dump_path: null     # → auto-set to <run_dir>/provenance_buffer.jsonl
+  perf_csv: null      # → auto-set to <run_dir>/provenance_perf.csv
+  performance_tracking: true
+
+# -----------------------------------------------------------
+# PDF report
+# -----------------------------------------------------------
+report:
+  enabled: true
+  output_filename: "report_{date}.pdf"
+  top_n: 5000
+  output_dir: null    # → auto-set to <run_dir>
+
+# -----------------------------------------------------------
+# LLM configuration — Argo gateway (ANL internal network)
+# -----------------------------------------------------------
+argo_mode: true
+argo_user: "agueroudji"           # or set ARGO_USER env var
+argo_fallback: true               # fall back to direct OpenAI/Anthropic if Argo fails
+
+fallback_models:
+  default:        "gpt-4o"
+  gpt5:           "gpt-4o"
+  gpt52:          "gpt-4o"
+  gpt54:          "gpt-4o"
+  claudeopus46:   "claude-opus-4-6"
+  claudesonnet46: "claude-sonnet-4-6"
+
+models:
+  # Generic roles
+  reasoning:     "gpt4o"
+  writing:       "gpt4o"
+
+  # Per-agent roles
+  generation:    "gpt5"
+  review:        "gpt52"
+  refinement:    "gpt54"
+
+  # PoC pipeline (Claude via Argo)
+  poc:           "claudeopus46"
+  poc_codegen:   "claudeopus46"
+  poc_fix:       "claudeopus46"
+  poc_interpret: "claudesonnet46"
+
+  # Report + commentary
+  report:        "claudesonnet46"
+  commentary:    "gpt52"
+
+  # Embedding — always local (no OpenAI API on compute nodes)
+  embedding:     "local-all-MiniLM-L6-v2"
+
+temperatures:
+  generation:    0.9
+  review:        0.5
+  refinement:    0.5
+  poc_codegen:   0.4
+  poc_fix:       0.3
+  poc_interpret: 0.2
+  report:        0.2
+  commentary:    0.5
+
+# -----------------------------------------------------------
+# Filesystem paths
+# -----------------------------------------------------------
+# Set these to absolute Lustre paths for Aurora runs.
+# Relative paths default to the current working directory.
+paths:
+  docs_dir:            "research_papers"
+  embeddings_dir:      "embeddings"
+  abstracts_cache_dir: "embeddings/abstracts"

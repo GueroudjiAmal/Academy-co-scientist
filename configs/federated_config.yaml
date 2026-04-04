@@ -1,0 +1,190 @@
+# ============================================================
+# Academy Co-Scientist — Federated Configuration
+# Aurora (remote) + Local
+# ============================================================
+#
+# Data-plane agents (VectorDB, Harvester) run on the Aurora
+# Globus Compute endpoint.  All reasoning agents (generation,
+# review, refinement, teams, PoC, report) run locally.
+#
+# Requires:
+#   • A running Redis instance (for cross-site message passing)
+#   • A registered Globus Compute endpoint on Aurora
+#   • ARGO_USER env var (or argo_user in this file)
+#   • OPENAI_API_KEY / ANTHROPIC_API_KEY if argo_mode: false
+#
+# Run:
+#   export ARGO_USER=agueroudji
+#   python -m academy_coscientist.simulator \
+#       --config configs/federated_config.yaml
+# ============================================================
+
+simulator:
+
+  topics:
+    - "Explore the intersection of vector databases and knowledge graph for HPC readiness of AI memory"
+
+  teams:
+    count: 2
+    reviewers_per_team: 2
+    hypotheses_per_cycle: 3
+    score_threshold: 0.6
+    min_pass_score: 0.50
+    max_refinement_rounds: 5
+    interval: 60.0
+    max_cycles: 2
+
+  agents:
+    generation:  2
+    review:      3
+    tournament:  1
+    vectordb:    1      # runs on Aurora (remote_exec = "aurora")
+    harvester:   1      # runs on Aurora (remote_exec = "aurora")
+
+  intervals:
+    generation:  60
+    review:      45
+    tournament:  30
+
+  hypotheses_per_cycle: 3
+  rag_top_k: 5
+
+  harvester:
+    papers_per_topic: 50
+    min_citation_count: 0
+    download_pdfs: true
+    loop_interval: 604800
+    loop_start_delay: 0
+
+  stagger_delay: 5.0
+  status_interval_seconds: 60.0
+  max_duration_seconds: null
+
+  # ---- Exchange ----
+  # Globus HTTP exchange for cross-site message passing between local and Aurora.
+  exchange:
+    type: http
+    address: "https://exchange.academy-agents.org"
+    auth_method: "globus"
+
+  # ---- Federated executors ----
+  # type: federated   → two named executors; default runs local agents.
+  # remote:           → executor name used for VectorDB and Harvester agents.
+  executor:
+    type: federated
+    default: "local"          # generation / review / tournament / PoC run here
+    remote: "aurora"          # VectorDB + Harvester run here
+
+    executors:
+      local:
+        type: thread
+        max_workers: 16
+
+      aurora:
+        type: globus
+        endpoint_id: "0a2848fc-007e-4318-a929-4b9eb445236e"
+        user_endpoint_config:
+          # Activate the venv and set required env vars on Aurora workers.
+          # Adjust the path to match your Aurora project space.
+          worker_init: >-
+            . /lus/flare/projects/CSC249ADCD08/agueroudji/academy-coscientist/venv/bin/activate;
+            export ARGO_USER=agueroudji;
+            export ACADEMY_CONFIG_PATH=/lus/flare/projects/CSC249ADCD08/agueroudji/academy-coscientist/configs/federated_config.yaml
+
+# -----------------------------------------------------------
+# Proof-of-concept agent
+# -----------------------------------------------------------
+# PoC agents run locally (Docker).
+poc:
+  enabled: true
+  top_n: 3
+  max_retries: 1
+  output_dir: null
+
+  docker_image:   "academy-poc-runner"
+  code_timeout:   90
+  docker_memory:  "512m"
+  docker_network: "none"
+
+# -----------------------------------------------------------
+# FlowCept provenance
+# -----------------------------------------------------------
+flowcept:
+  enabled: true
+  workflow_name: "academy-coscientist-federated"
+  dump_path: null
+  perf_csv: null
+  performance_tracking: true
+
+# -----------------------------------------------------------
+# PDF report
+# -----------------------------------------------------------
+report:
+  enabled: true
+  output_filename: "report_{date}.pdf"
+  top_n: 5000
+  output_dir: null
+
+# -----------------------------------------------------------
+# LLM configuration
+# -----------------------------------------------------------
+# Argo mode routes all LLM calls through the ANL gateway.
+# Disable and set OPENAI_API_KEY / ANTHROPIC_API_KEY to use
+# direct API calls from any machine.
+argo_mode: true
+argo_user: "agueroudji"
+
+# When argo_mode is true but an Argo call fails (network error, auth failure,
+# model unavailable), retry the same call using the direct OpenAI / Anthropic
+# API instead of surfacing an error to the agent.
+# Requires OPENAI_API_KEY and/or ANTHROPIC_API_KEY to be set.
+argo_fallback: true
+
+# Optional per-Argo-model overrides for the fallback model.
+# The built-in mapping covers most common names; add entries here only when
+# you need a different fallback than the default (e.g. prefer a cheaper model).
+fallback_models:
+  default:       "gpt-4o"          # catch-all when no specific mapping exists
+  gpt5:          "gpt-4o"
+  gpt52:         "gpt-4o"
+  gpt54:         "gpt-4o"
+  gpt4o:         "gpt-4o"
+  claudeopus46:  "claude-opus-4-6"
+  claudesonnet46: "claude-sonnet-4-6"
+
+models:
+  reasoning:     "gpt4o"
+  writing:       "gpt4o"
+
+  generation:    "gpt5"
+  review:        "gpt52"
+  refinement:    "gpt54"
+
+  poc:           "claudeopus46"
+  poc_codegen:   "claudeopus46"
+  poc_fix:       "claudeopus46"
+  poc_interpret: "claudesonnet46"
+
+  report:        "claudesonnet46"
+  commentary:    "gpt52"
+
+  # Local embedding — no API key needed, works on both local and Aurora.
+  embedding:     "local-all-MiniLM-L6-v2"
+
+temperatures:
+  generation:    0.9
+  review:        0.5
+  refinement:    0.5
+  poc_codegen:   0.4
+  poc_fix:       0.3
+  poc_interpret: 0.2
+  report:        0.2
+  commentary:    0.5
+
+# -----------------------------------------------------------
+# Filesystem paths
+# -----------------------------------------------------------
+paths:
+  docs_dir:            "research_papers"
+  embeddings_dir:      "embeddings"
+  abstracts_cache_dir: "embeddings/abstracts"
