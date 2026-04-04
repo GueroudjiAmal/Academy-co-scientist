@@ -1,0 +1,250 @@
+# ============================================================
+# Academy Co-Scientist — Autonomous Simulator Configuration
+# ============================================================
+#
+# Run with:
+#   python -m academy_coscientist.simulator --config configs/simulator_config.yaml
+#
+# CLI overrides (any key can be set at the command line), e.g.:
+#   --topic "quantum error correction"
+#   --generation-agents 4
+#   --max-duration 3600
+# ============================================================
+
+# -----------------------------------------------------------
+# Simulator core settings
+# -----------------------------------------------------------
+simulator:
+
+  # Research topics distributed round-robin across generation agents.
+  # Add as many topics as you like; agents cycle through them.
+  topics:
+    #- "The goal is to numerically calculate and analyze the Lyapunov spectra of recurrent neural networks with short-term synaptic modulations. Such networks have two sets of dynamical state variables that include state of neurons and state of synaptic modulations. Implement a randomly and, for efficiency, sparsely connected recurrent neural network and evolve it without any inputs for different values of gain g. For each simulation, calculate the Lyapunov spectra and check whether (a) how the distribution of Lyapunov exponents is affected by synaptic modulations and (b) how the largest Lyapunov exponent, as a function of g, changes depending on the type of synaptic modulations. Use (1) Hebbian, (2) anti-Hebbian, and (3) presynaptic only synaptic modulations. The modulations should be multiplicative, as in the attached paper."
+    #- "Reliability of LLM-based scientific hypotheses and reproducibility of AI-generated code"
+     - "Explore the intersection of vector databases and knowledge graph for HPC readiness of AI memory"
+    # - "Protein folding prediction methods"
+    # - "Quantum error correction algorithms"
+    # - "Use machine Learning methods to reconstruct events in the Hyper Kamiokande detector"
+    # - "HPC-ready Agentic Memory, how to apply the HPC wisdom to the design of memory-efficient agentic systems"
+  # ---- Team mode (comment out or remove the `teams:` block to use flat mode) ----
+  #
+  # In team mode, co-scientists work as chained teams:
+  #   Team 0  generates hypotheses from scratch and refines them until they
+  #           reach score_threshold, then forwards them to Team 1's staging area.
+  #   Team 1  receives Team 0's validated hypotheses, refines them further to a
+  #           higher standard (score_threshold + 0.10 per team), then pushes the
+  #           best to the shared global tournament.
+  #   (More teams can be added by increasing count.)
+  #
+  # Teams mode replaces the flat agents/intervals launch below.
+  # The global tournament and harvester agents are always launched regardless of mode.
+  teams:
+    count: 2                  # Number of chained teams
+    reviewers_per_team: 2     # ReviewAgents per team
+    hypotheses_per_cycle: 3   # Hypotheses generated/pulled per team loop cycle
+    score_threshold: 0.6     # Minimum avg score for a hypothesis to pass (Team 0)
+                              # Each subsequent team's threshold increases by +0.10
+    min_pass_score: 0.50      # Below this after max rounds → discard
+    max_refinement_rounds: 5  # Max refine-then-re-review iterations per hypothesis
+    interval: 60.0            # Seconds between team loop cycles
+    max_cycles: 2             # Each team stops after this many cycles (null = unlimited)
+
+  # ---- Flat-mode agent counts (used when `teams:` block is absent/commented) ----
+  agents:
+    generation:  2      # HypothesisGenerationAgent instances
+    review:      3      # ReviewAgent instances (independent reviewers)
+    tournament:  1      # TournamentAgent instances (shared ranking pool)
+    vectordb:    1      # ResearchVectorDBAgent instances (0 to disable)
+    harvester:   1      # PaperHarvesterAgent instances (0 to disable)
+
+  # ---- Loop intervals for flat mode (seconds) ----
+  intervals:
+    generation:   60    # Generate N hypotheses every 60 s
+    review:       45    # Review all pending hypotheses every 45 s
+    tournament:   30    # Re-rank/normalize scores every 30 s
+
+  # Hypotheses each generation agent proposes per loop cycle (flat mode)
+  hypotheses_per_cycle: 3
+
+  # Number of vector-DB results injected into generation and review prompts.
+  # Lower values keep prompts focused on the closest matches; higher values
+  # broaden context at the cost of longer/noisier prompts.
+  # Capped automatically at the number of documents in the index.
+  rag_top_k: 5
+
+  # ---- Paper harvester settings ----
+  # The harvester discovers open-access papers for each research topic and
+  # stores them locally so the vector DB stays current.
+  #
+  # Paper sources are tried in order until one returns results:
+  #   1. Semantic Scholar  — most-cited papers; set SEMANTIC_SCHOLAR_API_KEY
+  #                          env var to raise the rate limit to 10 req/s.
+  #   2. OpenAlex          — fully open, no key required; set OPENALEX_EMAIL
+  #                          env var to join the polite pool (higher limits).
+  #   3. arXiv             — newest preprints, no key required.
+  harvester:
+    # Papers to fetch per topic per harvest run
+    papers_per_topic: 50
+
+    # Only keep papers with at least this many citations (0 = no filter).
+    # Note: arXiv results always have citationCount=0, so this filter does
+    # not apply when arXiv is the active source.
+    min_citation_count: 0
+
+    # Download actual PDFs when open-access links are available.
+    # Set to false to save only abstract .txt files (faster, less disk).
+    download_pdfs: true
+
+    # How often to run the harvest (seconds).
+    # Default: 604800 = one week.  Use 3600 for hourly during testing.
+    loop_interval: 604800
+
+    # Delay before the FIRST harvest run (seconds).
+    # 0 = harvest immediately on startup (recommended so the vector DB is
+    # populated before generation agents begin proposing hypotheses).
+    loop_start_delay: 0
+
+  # Stagger agent startup by this many seconds to avoid thundering-herd
+  stagger_delay: 5.0
+
+  # Print a leaderboard snapshot to stdout every N seconds (0 to disable)
+  status_interval_seconds: 60.0
+
+  # Stop automatically after this many seconds (null = run until PoC finishes or Ctrl-C)
+  max_duration_seconds: null
+
+  # ---- Exchange backend ----
+  # "local"  — single-process, ThreadPoolExecutor (great for dev/testing)
+  # "redis"  — multi-process via Redis message broker
+  # "http"   — Globus / Academy cloud exchange
+  exchange:
+    type: redis
+    # Redis options (used when type: redis)
+    redis_host: "localhost"
+    redis_port: 6379
+    # HTTP options (used when type: http)
+    address: "https://exchange.academy-agents.org"
+    auth_method: "globus"
+
+  # ---- Executor ----
+  # "thread"  — ThreadPoolExecutor (default; safest for local dev)
+  # "process" — ProcessPoolExecutor (true parallelism; requires picklable agents)
+  executor:
+    type: process
+    max_workers: 16
+
+# -----------------------------------------------------------
+# Proof-of-concept agent
+# -----------------------------------------------------------
+# After all teams complete, the PoC agent takes the top-N hypotheses,
+# asks Claude to write a real Python experiment for each, runs it in a
+# subprocess, fixes errors (up to max_retries times), and saves
+# code + interpretation to output_dir.
+poc:
+  # Set to false to skip PoC execution entirely.
+  enabled: true
+
+  # Number of top-ranked hypotheses to turn into experiments.
+  top_n: 3
+
+  # Maximum fix-and-retry attempts if the generated script fails.
+  max_retries: 1
+
+  # Where to write poc_code.py and report.json for each hypothesis.
+  # null (default) → auto-set to <run_dir>/poc_results
+  # Explicit path   → use exactly that directory.
+  output_dir: null
+
+  # ---- Docker execution sandbox ----
+  # Code is passed to the container via stdin (python -); no filesystem mounts.
+  docker_image:   "academy-poc-runner"  # Build first: docker build -t academy-poc-runner docker/
+  code_timeout:   90                  # Wall-clock limit in seconds per execution
+  docker_memory:  "512m"              # Container --memory limit
+  docker_network: "none"              # "none" = fully isolated; "bridge" if internet needed
+
+# -----------------------------------------------------------
+# FlowCept provenance plugin
+# -----------------------------------------------------------
+# Captures every agent @action and LLM call as provenance records.
+# Requires: pip install flowcept
+#
+# Query the buffer after a run:
+#   python -c "from flowcept import Flowcept; import json; \
+#              [print(r) for r in Flowcept.read_buffer_file()]"
+flowcept:
+  # Set to false to disable provenance tracking entirely.
+  enabled: true
+
+  workflow_name: "academy-coscientist"
+
+  # Path to the JSONL provenance buffer file.
+  # null (default) → auto-set to <run_dir>/provenance_buffer.jsonl
+  dump_path: null
+
+  # Path to the per-call wall-clock overhead CSV.
+  # null (default) → auto-set to <run_dir>/provenance_perf.csv
+  perf_csv: null
+
+  # Measure and report the wall-clock overhead of each provenance-capture call.
+  # Set to false to eliminate its memory/CPU cost.
+  performance_tracking: true
+
+# -----------------------------------------------------------
+# PDF report agent
+# -----------------------------------------------------------
+# Generates a comprehensive PDF report at the end of each run,
+# including hypothesis leaderboard, per-reviewer critiques, full
+# refinement history, PoC results, and Claude-written narratives.
+report:
+  # Set to false to skip report generation entirely.
+  enabled: true
+
+  # Filename template; {date} → YYYYMMDD_HHMMSS.
+  output_filename: "report_{date}.pdf"
+
+  # Number of top hypotheses to include in full detail.
+  top_n: 5000
+
+  # Directory to write the PDF report.
+  # null (default) → auto-set to <run_dir>
+  # Explicit path   → use exactly that directory.
+  output_dir: null
+
+# -----------------------------------------------------------
+# LLM model configuration
+# -----------------------------------------------------------
+argo_mode: true                         # Route ALL LLM calls through the Argo gateway
+argo_user: "agueroudji"                       # ANL username (or set ARGO_USER env var)
+
+models:
+  # --- Per-agent-type models (one knob per agent) ---
+  generation:    "gpt5"                # HypothesisGenerationAgent — brainstorming
+  review:        "gpt52"                # ReviewAgent — scoring and critique
+  refinement:    "gpt54"                # HypothesisRefinerAgent — refining
+  poc_codegen:   "claudeopus46"         # PoC code generation
+  poc_fix:       "claudeopus46"         # PoC code fixing
+  poc_interpret: "claudeopus46"         # PoC result interpretation
+  report:        "gemini25pro"          # PDF report narratives
+  commentary:    "gpt52"               # Agent self-commentary (all agents)
+  # --- Infrastructure ---
+  embedding:     "local-all-MiniLM-L6-v2"  # Local FAISS (no API key needed)
+  argo:          "gpt54"               # Default for call_argo_llm() if no role matches
+
+# Temperature per agent type.
+temperatures:
+  generation:    0.9   # HypothesisGenerationAgent — brainstorming new hypotheses
+  review:        0.5   # ReviewAgent — deterministic scoring and critique
+  refinement:    0.5   # HypothesisRefinerAgent — focused improvement
+  poc_codegen:   0.4   # PoC code generation — creative, exploratory
+  poc_fix:       0.3   # PoC code fixing — deterministic bug fixing
+  poc_interpret: 0.2   # PoC result interpretation — factual, precise
+  report:        0.2   # PDF report narratives
+  commentary:    0.5   # Agent self-commentary (all agents)
+
+# -----------------------------------------------------------
+# Filesystem paths
+# -----------------------------------------------------------
+paths:
+  docs_dir:            "research_papers"    # Harvested PDFs and abstracts
+  embeddings_dir:      "embeddings"         # FAISS index files
+  abstracts_cache_dir: "embeddings/abstracts"

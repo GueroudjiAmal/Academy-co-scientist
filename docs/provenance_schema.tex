@@ -1,0 +1,992 @@
+% ============================================================
+% Academy Co-Scientist — FlowCept Provenance Data Schema
+% ============================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{caption}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{forest}
+\usepackage{listings}
+\usepackage{enumitem}
+
+\definecolor{fieldgray}{gray}{0.93}
+\definecolor{subtypeblue}{RGB}{30,90,160}
+\definecolor{optred}{RGB}{180,40,40}
+\definecolor{condorange}{RGB}{200,100,0}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=subtypeblue,
+  urlcolor=subtypeblue,
+  pdftitle={Academy Co-Scientist Provenance Schema},
+  pdfauthor={Academy Co-Scientist},
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{Academy Co-Scientist — Provenance Schema}
+\lhead{}
+\cfoot{\thepage}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+
+% Shorthand for optional marker
+\newcommand{\opt}{\textcolor{optred}{opt}}
+\newcommand{\cond}{\textcolor{condorange}{cond}}
+\newcommand{\req}{\textbf{req}}
+
+% Subtype badge style
+\newcommand{\subtype}[1]{\texttt{\textcolor{subtypeblue}{#1}}}
+
+\captionsetup[table]{skip=4pt}
+
+\title{\textbf{Academy Co-Scientist}\\[0.4em]
+       \large FlowCept Provenance Data Schema\\[0.2em]
+       \normalsize All record types emitted to the JSONL provenance buffer}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{fancy}
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Overview}
+% ============================================================
+
+All provenance records are serialised as JSON objects and appended line-by-line
+to a \texttt{.jsonl} buffer file (one object per line).
+Records are produced by four plugins:
+
+\begin{itemize}[itemsep=2pt]
+  \item \textbf{\texttt{FlowceptAcademyPlugin}} — patches \texttt{academy.runtime.Runtime}
+        at the class level; captures every \texttt{@action}, \texttt{@loop},
+        agent lifecycle event, and LLM/embedding call.
+  \item \textbf{\texttt{FlowceptLangGraphPlugin}} — LangChain
+        \texttt{BaseCallbackHandler} that captures graph runs, node executions,
+        LLM calls, and tool calls.
+  \item \textbf{\texttt{FlowceptCrewAIPlugin}} — combines CrewAI's native event
+        bus (crew/task/agent lifecycle) with before/after LLM and tool hooks
+        (richer data than the event bus alone).
+  \item \textbf{\texttt{FlowceptAutoGenPlugin}} — wraps \texttt{team.run\_stream()}
+        to capture AutoGen team runs and individual messages.
+\end{itemize}
+
+All plugins share the same \textbf{FlowCept} in-memory buffer and the same
+top-level \texttt{workflow\_id} when combined via \texttt{from\_academy\_plugin()}.
+
+\subsection*{Notation}
+\begin{itemize}[itemsep=2pt]
+  \item \req\ — field always present
+  \item \opt\ — field present only when the relevant data is available
+  \item \cond\ — field present conditionally (depends on \texttt{call\_type},
+        status, or plugin configuration); explained in the table notes
+\end{itemize}
+
+% ============================================================
+\section{Provenance Hierarchy}
+% ============================================================
+
+\begin{figure}[h!]
+\centering
+\begin{forest}
+for tree={
+  font=\small\ttfamily,
+  grow'=0,
+  draw,
+  rounded corners,
+  l sep=6mm,
+  s sep=2mm,
+  edge={-latex},
+}
+[campaign\_id (session)
+  [workflow\_id (top-level run)
+    [WorkflowObject: agent sub-wf \textrm{(Academy)}
+      [academy\_lifecycle]
+      [academy\_loop]
+      [academy\_action
+        [llm\_call]
+      ]
+    ]
+    [WorkflowObject: graph/kickoff/run
+      [langgraph\_graph / crewai\_crew / autogen\_run
+        [langgraph\_node / crewai\_task / autogen\_message
+          [llm\_call]
+          [tool\_call]
+        ]
+        [crewai\_agent
+          [llm\_call \textrm{(hook)}]
+          [tool\_call \textrm{(hook)}]
+        ]
+      ]
+    ]
+  ]
+]
+\end{forest}
+\caption{Provenance hierarchy. Arrows denote \texttt{parent\_task\_id} /
+         \texttt{parent\_workflow\_id} linkage.}
+\end{figure}
+
+% ============================================================
+\section{Common Envelope}
+% ============================================================
+
+Every record — regardless of plugin or subtype — carries the following fields.
+They are injected by \texttt{intercept\_task()} and
+\texttt{TaskObject.enrich\_task\_dict()}.
+
+\begin{longtable}{L{3.5cm} L{2.5cm} C{1.2cm} L{7cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\multicolumn{4}{c}{\small\itshape (continued)} \\
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{task\_id}            & uuid string   & \req  & Unique identifier for this record \\
+\rowcolor{fieldgray}
+\texttt{workflow\_id}        & uuid string   & \req  & Top-level workflow for the run \\
+\texttt{campaign\_id}        & uuid string   & \req  & FlowCept campaign (session-level grouping) \\
+\rowcolor{fieldgray}
+\texttt{subtype}             & string        & \req  & Record type discriminator — see Section~\ref{sec:subtypes} \\
+\texttt{activity\_id}        & string        & \req  & Human-readable name: action name, node name, model ID, agent role, etc. \\
+\rowcolor{fieldgray}
+\texttt{group\_id}           & uuid string   & \opt  & Groups all tasks in one invocation (loop, graph run, kickoff, team run) \\
+\texttt{parent\_task\_id}    & uuid string   & \opt  & Links child to parent record via \texttt{task\_id} \\
+\rowcolor{fieldgray}
+\texttt{started\_at}         & float         & \req  & Wall-clock start time (Unix epoch seconds) \\
+\texttt{ended\_at}           & float         & \req  & Wall-clock end time (Unix epoch seconds) \\
+\rowcolor{fieldgray}
+\texttt{status}              & string enum   & \req  & \texttt{"FINISHED"} or \texttt{"ERROR"} \\
+\texttt{stderr}              & string        & \opt  & Error message; present only when \texttt{status = ERROR} \\
+\rowcolor{fieldgray}
+\texttt{used}                & object        & \opt  & Input / request data — structure varies by subtype \\
+\texttt{generated}           & object        & \opt  & Output / response data — structure varies by subtype \\
+\rowcolor{fieldgray}
+\texttt{custom\_metadata}    & object        & \opt  & Framework-specific context \\
+\texttt{telemetry\_at\_start}& object        & \opt  & CPU/memory snapshot at start (when telemetry is enabled) \\
+\rowcolor{fieldgray}
+\texttt{telemetry\_at\_end}  & object        & \opt  & CPU/memory snapshot at end \\
+\texttt{node\_name}          & string        & \opt  & Compute node name — from \texttt{enrich\_task\_dict()} \\
+\rowcolor{fieldgray}
+\texttt{login\_name}         & string        & \opt  & OS user name \\
+\texttt{hostname}            & string        & \opt  & Full hostname \\
+\rowcolor{fieldgray}
+\texttt{public\_ip}          & string        & \opt  & Public IP of the node \\
+\texttt{private\_ip}         & string        & \opt  & Private IP of the node \\
+
+\caption{Common record envelope — all subtypes.}
+\label{tab:common}
+\end{longtable}
+
+% ============================================================
+\section{Record Types by Subtype}
+\label{sec:subtypes}
+% ============================================================
+
+% ------------------------------------------------------------
+\subsection{Academy Plugin (\texttt{flowcept\_plugin.py})}
+% ------------------------------------------------------------
+
+\subsubsection{\subtype{academy\_action}}
+
+Emitted once per \texttt{@action} dispatch by the patched
+\texttt{Runtime.action()}. In addition to the common envelope:
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{agent\_id}
+  & string & \req
+  & Real Academy agent identifier (\texttt{AgentId<hex>}) \\
+\rowcolor{fieldgray}
+\multicolumn{4}{l}{\textit{\textbf{used} object}} \\
+\texttt{used.args}
+  & any & \req & Positional arguments passed to the action \\
+\rowcolor{fieldgray}
+\texttt{used.kwargs}
+  & object & \req & Keyword arguments passed to the action \\
+\multicolumn{4}{l}{\textit{\textbf{generated} object}} \\
+\rowcolor{fieldgray}
+\texttt{generated}
+  & any & \opt & Return value of the action (absent on error) \\
+\multicolumn{4}{l}{\textit{\textbf{custom\_metadata} object}} \\
+\rowcolor{fieldgray}
+\texttt{agent\_type}
+  & string & \req & Agent class name (e.g.\ \texttt{TeamCoordinatorAgent}) \\
+\texttt{source\_id}
+  & string & \req & Caller identity: \texttt{AgentId<hex>} or \texttt{UserId<hex>} \\
+\rowcolor{fieldgray}
+\texttt{cross\_agent\_call}
+  & bool & \req & \texttt{true} when the caller is another agent \\
+\texttt{source\_agent\_id}
+  & string & \opt & Set when \texttt{cross\_agent\_call} is true \\
+\rowcolor{fieldgray}
+\texttt{source\_workflow\_id}
+  & uuid string & \opt & Sub-workflow ID of the calling agent \\
+
+\caption{\subtype{academy\_action} record fields.}
+\end{longtable}
+
+\subsubsection{\subtype{academy\_loop}}
+
+Emitted at loop \textbf{start}, \textbf{exit}, and \textbf{error} by the patched
+\texttt{Runtime.\_execute\_loop()}. All three events share the same
+\texttt{task\_id} and \texttt{group\_id}.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{agent\_id} & string & \req & \texttt{AgentId<hex>} \\
+\rowcolor{fieldgray}
+\multicolumn{4}{l}{\textit{\textbf{custom\_metadata} object}} \\
+\texttt{agent\_type} & string & \req & Agent class name \\
+\rowcolor{fieldgray}
+\texttt{loop\_event}
+  & string enum & \req & \texttt{"start"} | \texttt{"exit"} | \texttt{"error"} \\
+
+\caption{\subtype{academy\_loop} record fields.}
+\end{longtable}
+
+\subsubsection{\subtype{academy\_lifecycle}}
+
+One record each for \texttt{agent\_startup} and \texttt{agent\_shutdown}.
+\texttt{activity\_id} is the event name.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{agent\_id} & string & \req & \texttt{AgentId<hex>} \\
+\rowcolor{fieldgray}
+\multicolumn{4}{l}{\textit{\textbf{custom\_metadata} object}} \\
+\texttt{agent\_type} & string & \req & Agent class name \\
+
+\caption{\subtype{academy\_lifecycle} record fields.}
+\end{longtable}
+
+% ========================
+\subsubsection{\subtype{llm\_call} (Academy)}
+\label{sec:llm-academy}
+% ========================
+
+Emitted inside \texttt{\_process\_llm\_call()} via the LLM hook registered by
+\texttt{FlowceptAcademyPlugin}. The \texttt{used} and \texttt{generated}
+sub-objects vary by \texttt{call\_type}.
+
+\paragraph{Common \& identity fields}
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{agent\_id}
+  & string & \req
+  & \texttt{AgentId<hex>} from \texttt{\_current\_academy\_agent\_id} ContextVar;
+    falls back to agent class name \\
+\rowcolor{fieldgray}
+\texttt{parent\_task\_id}
+  & uuid string & \opt
+  & ID of the enclosing \subtype{academy\_action} task from
+    \texttt{\_current\_action\_task\_id} ContextVar \\
+
+\caption{\subtype{llm\_call} (Academy) — identity fields.}
+\end{longtable}
+
+\paragraph{\texttt{used} object — request side}
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{model}
+  & string & \req & Requested model identifier \\
+\rowcolor{fieldgray}
+\texttt{model\_used}
+  & string & \req & Model actually used (may differ due to routing) \\
+\texttt{call\_type}
+  & string & \req
+  & Logical call type from \texttt{ctx["call\_type"]}; one of
+    \texttt{parsed\_json\_result}, \texttt{chat\_completion},
+    \texttt{embed\_result\_local}, \texttt{embed\_result\_openai} \\
+\rowcolor{fieldgray}
+\texttt{temperature\_requested}
+  & float & \opt & Temperature value passed to the call \\
+\texttt{temperature\_sent}
+  & float & \opt & Temperature value actually sent to the API \\
+\rowcolor{fieldgray}
+\texttt{temperature\_suppressed}
+  & bool & \req
+  & \texttt{true} when the model ignores temperature
+    (e.g.\ o1, o4-mini reasoning models) \\
+\texttt{temperature\_null\_reason}
+  & string & \cond
+  & Present when temperature is null; one of
+    \texttt{"reasoning\_model\_does\_not\_accept\_temperature"},
+    \texttt{"not\_applicable\_for\_embeddings"},
+    \texttt{"not\_set"} \\
+\rowcolor{fieldgray}
+\texttt{messages}
+  & list & \opt & Full message list when present in the payload \\
+\texttt{system\_instructions}
+  & string & \opt & System prompt \\
+\rowcolor{fieldgray}
+\texttt{user\_prompt}
+  & string & \opt & User message \\
+\texttt{schema\_hint}
+  & any & \opt & JSON schema for structured output \\
+\rowcolor{fieldgray}
+\texttt{agent\_class}
+  & string & \req & Agent class name (e.g.\ \texttt{HypothesisRefinerAgent}) \\
+\texttt{academy\_agent\_id}
+  & string & \opt & Raw \texttt{AgentId<hex>} string \\
+\rowcolor{fieldgray}
+\texttt{ctx\_<key>}
+  & any & \opt
+  & Every field from the caller's \texttt{context=\{\}} dict is hoisted
+    with a \texttt{ctx\_} prefix
+    (e.g.\ \texttt{ctx\_hyp\_id}, \texttt{ctx\_team},
+    \texttt{ctx\_instance\_id}, \texttt{ctx\_call\_type}) \\
+
+\caption{\subtype{llm\_call} (Academy) — \texttt{used} object.}
+\end{longtable}
+
+\paragraph{\texttt{generated} object — response side, by \texttt{call\_type}}
+
+\noindent\textbf{(a)~\texttt{parsed\_json\_result}} — structured LLM call via
+\texttt{\_call\_llm\_json}:
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{finish\_reason}      & string & \opt & API finish reason \\
+\rowcolor{fieldgray}
+\texttt{prompt\_tokens}      & int    & \opt & Token usage \\
+\texttt{completion\_tokens}  & int    & \opt & Token usage \\
+\rowcolor{fieldgray}
+\texttt{total\_tokens}       & int    & \opt & Total token usage \\
+\texttt{parsed\_response}    & object & \req & Full structured dict returned by the LLM \\
+\rowcolor{fieldgray}
+\texttt{fallback\_used}      & bool   & \req & Whether regex fallback was needed to extract JSON \\
+\texttt{raw\_response\_text} & string & \req & Raw text before JSON parsing \\
+\rowcolor{fieldgray}
+\texttt{<key>}
+  & any & \cond
+  & \textbf{Every top-level key of \texttt{parsed\_response} is also hoisted
+    directly} into \texttt{generated} for direct queryability
+    (e.g.\ \texttt{score}, \texttt{title}, \texttt{description},
+    \texttt{recommendation}, \texttt{weaknesses}) \\
+
+\caption{\subtype{llm\_call} (Academy) — \texttt{generated} for \texttt{parsed\_json\_result}.}
+\end{longtable}
+
+\noindent\textbf{(b)~\texttt{chat\_completion}} — raw text call:
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{finish\_reason}     & string & \opt & API finish reason \\
+\rowcolor{fieldgray}
+\texttt{prompt\_tokens}     & int    & \opt & Token usage \\
+\texttt{completion\_tokens} & int    & \opt & \\
+\rowcolor{fieldgray}
+\texttt{total\_tokens}      & int    & \opt & \\
+\texttt{response\_text}     & string & \req & Full raw text response \\
+\rowcolor{fieldgray}
+\texttt{parsed\_response}   & object & \opt & Inline JSON parsed from the text, if valid \\
+\texttt{<key>}              & any    & \cond
+  & Top-level keys from inline JSON hoisted directly \\
+
+\caption{\subtype{llm\_call} (Academy) — \texttt{generated} for \texttt{chat\_completion}.}
+\end{longtable}
+
+\noindent\textbf{(c)~\texttt{embed\_result\_local} / \texttt{embed\_result\_openai}} — embedding calls:
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{num\_vectors} & int & \opt & Number of embedding vectors returned \\
+\rowcolor{fieldgray}
+\texttt{embed\_dim}   & int & \opt & Dimensionality of each embedding vector \\
+
+\caption{\subtype{llm\_call} (Academy) — \texttt{generated} for embedding calls.}
+\end{longtable}
+
+\noindent\textbf{Error case} (any \texttt{call\_type} when \texttt{status = ERROR}):
+
+\vspace{0.3em}
+\texttt{generated.error} \textit{(string)} — \texttt{str(exception)}.
+
+\paragraph{\texttt{custom\_metadata} object}
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{llm\_call\_type} & string & \req & Raw \texttt{call\_type} value \\
+\rowcolor{fieldgray}
+\texttt{hyp\_id}         & string & \opt & Hypothesis ID from \texttt{ctx["hyp\_id"]} \\
+
+\caption{\subtype{llm\_call} (Academy) — \texttt{custom\_metadata}.}
+\end{longtable}
+
+% ------------------------------------------------------------
+\subsection{LangGraph Plugin (\texttt{flowcept\_langgraph\_plugin.py})}
+% ------------------------------------------------------------
+
+\subsubsection{\subtype{langgraph\_graph}}
+
+One record per \texttt{graph.invoke()} / \texttt{graph.ainvoke()} call.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{used.inputs}           & object & \req & Graph input state \\
+\rowcolor{fieldgray}
+\texttt{generated.outputs}     & object & \req & Graph output state \\
+\texttt{custom\_metadata.tags} & list   & \req & LangChain tags \\
+\rowcolor{fieldgray}
+\texttt{custom\_metadata.graph\_name}      & string & \req & Graph name \\
+\texttt{custom\_metadata.source\_agent\_id}& string & \opt
+  & Academy \texttt{AgentId} that produced the input
+    (from \texttt{state["\_source\_agent\_id"]}) \\
+
+\caption{\subtype{langgraph\_graph} record fields.}
+\end{longtable}
+
+\subsubsection{\subtype{langgraph\_node}}
+
+One record per node execution within a graph run.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{used.inputs}            & object & \req & Node input state \\
+\rowcolor{fieldgray}
+\texttt{generated.outputs}      & object & \req & Node output state \\
+\texttt{custom\_metadata.tags}  & list   & \req & LangChain tags \\
+\rowcolor{fieldgray}
+\texttt{custom\_metadata.node\_name}       & string & \req & Node name \\
+\texttt{custom\_metadata.source\_agent\_id}& string & \opt & Cross-framework linkage \\
+\rowcolor{fieldgray}
+\texttt{parent\_task\_id}       & uuid   & \opt & Enclosing \subtype{langgraph\_graph} \texttt{task\_id} \\
+
+\caption{\subtype{langgraph\_node} record fields.}
+\end{longtable}
+
+\subsubsection{\subtype{llm\_call} (LangGraph)}
+
+Emitted by \texttt{on\_llm\_start} + \texttt{on\_llm\_end} (completion models)
+or \texttt{on\_chat\_model\_start} + \texttt{on\_llm\_end} (chat models).
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\multicolumn{4}{l}{\textit{\textbf{used} object}} \\
+\rowcolor{fieldgray}
+\texttt{prompts}  & list[string] & \cond & Raw prompt strings (\texttt{on\_llm\_start} path) \\
+\texttt{messages} & list[list[string]] & \cond
+  & Serialised message content arrays (\texttt{on\_chat\_model\_start} path) \\
+\rowcolor{fieldgray}
+\texttt{model}    & string & \req & Model name from \texttt{serialized.kwargs} \\
+\multicolumn{4}{l}{\textit{\textbf{generated} object}} \\
+\rowcolor{fieldgray}
+\texttt{text}               & string & \req & First generation text from \texttt{LLMResult} \\
+\texttt{prompt\_tokens}     & int    & \opt & From \texttt{llm\_output.token\_usage} \\
+\rowcolor{fieldgray}
+\texttt{completion\_tokens} & int    & \opt & \\
+\texttt{total\_tokens}      & int    & \opt & \\
+\rowcolor{fieldgray}
+\texttt{model}              & string & \req & Resolved model from \texttt{llm\_output.model\_name} \\
+\multicolumn{4}{l}{\textit{\textbf{custom\_metadata} object}} \\
+\rowcolor{fieldgray}
+\texttt{model}              & string & \req & Model name \\
+\multicolumn{4}{l}{\textit{Linkage}} \\
+\rowcolor{fieldgray}
+\texttt{parent\_task\_id}   & uuid   & \opt & Enclosing \subtype{langgraph\_node} \texttt{task\_id} \\
+
+\caption{\subtype{llm\_call} (LangGraph) record fields.}
+\end{longtable}
+
+\subsubsection{\subtype{tool\_call} (LangGraph)}
+
+Emitted by \texttt{on\_tool\_start} + \texttt{on\_tool\_end}.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{used.input}              & string & \req & Tool input string \\
+\rowcolor{fieldgray}
+\texttt{generated.output}        & string & \req & Tool output string \\
+\texttt{custom\_metadata.tool\_name} & string & \req & From \texttt{serialized["name"]} \\
+\rowcolor{fieldgray}
+\texttt{parent\_task\_id}        & uuid   & \opt & Enclosing \subtype{langgraph\_node} \texttt{task\_id} \\
+
+\caption{\subtype{tool\_call} (LangGraph) record fields.}
+\end{longtable}
+
+% ------------------------------------------------------------
+\subsection{CrewAI Plugin (\texttt{flowcept\_crewai\_plugin.py})}
+% ------------------------------------------------------------
+
+\subsubsection{\subtype{crewai\_crew}}
+
+One record per \texttt{crew.kickoff()} call; emitted via the event bus.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{used.inputs}                & object & \req & \texttt{kickoff(inputs=...)} dict \\
+\rowcolor{fieldgray}
+\texttt{used.crew\_name}            & string & \req & Crew name \\
+\texttt{generated.output}           & any    & \req & Crew output \\
+\rowcolor{fieldgray}
+\texttt{generated.total\_tokens}    & int    & \opt & Aggregate token count if available \\
+\texttt{custom\_metadata.crew\_name}& string & \req & Crew name \\
+\rowcolor{fieldgray}
+\texttt{custom\_metadata.framework} & string & \req & \texttt{"crewai"} \\
+
+\caption{\subtype{crewai\_crew} record fields.}
+\end{longtable}
+
+\subsubsection{\subtype{crewai\_task}}
+
+One record per CrewAI task execution; emitted via the event bus.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{used.context}               & object & \opt & Task context dict \\
+\rowcolor{fieldgray}
+\texttt{used.task}                  & object & \opt & Serialised task object \\
+\texttt{generated.output}           & any    & \req & Task output \\
+\rowcolor{fieldgray}
+\texttt{custom\_metadata.task\_name}& string & \req & Task name \\
+\texttt{custom\_metadata.agent\_role}& string & \req & Role of the assigned agent \\
+\rowcolor{fieldgray}
+\texttt{custom\_metadata.framework} & string & \req & \texttt{"crewai"} \\
+
+\caption{\subtype{crewai\_task} record fields.}
+\end{longtable}
+
+\subsubsection{\subtype{crewai\_agent}}
+
+One record per agent execution within a task; emitted via the event bus.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{used.task\_prompt}           & string & \req & Full task prompt seen by the agent \\
+\rowcolor{fieldgray}
+\texttt{used.tools}                  & list   & \req & Tool names available to the agent \\
+\texttt{generated.output}            & any    & \req & Agent execution output \\
+\rowcolor{fieldgray}
+\texttt{custom\_metadata.agent\_role}& string & \req & Agent role \\
+\texttt{custom\_metadata.framework}  & string & \req & \texttt{"crewai"} \\
+\rowcolor{fieldgray}
+\texttt{parent\_task\_id}            & uuid   & \opt & Enclosing \subtype{crewai\_task} \texttt{task\_id} \\
+
+\caption{\subtype{crewai\_agent} record fields.}
+\end{longtable}
+
+\subsubsection{\subtype{llm\_call} (CrewAI hook)}
+\label{sec:llm-crewai}
+
+Emitted by \texttt{before\_llm\_call} + \texttt{after\_llm\_call} hooks.
+These records are \textbf{richer} than event-bus LLM events because the hooks
+receive the full agent and task context objects.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\multicolumn{4}{l}{\textit{\textbf{used} object}} \\
+\rowcolor{fieldgray}
+\texttt{messages}
+  & list[\{role, content\}] & \req
+  & Full message list passed to the LLM with \texttt{role} and \texttt{content}
+    for each turn \\
+\texttt{model}
+  & string & \req & From \texttt{context.llm.model} or \texttt{context.llm.model\_name} \\
+\rowcolor{fieldgray}
+\texttt{iterations}
+  & int & \req & Current ReAct loop iteration count \\
+\texttt{agent\_role}
+  & string & \req & \texttt{context.agent.role} \\
+\rowcolor{fieldgray}
+\texttt{agent\_goal}
+  & string & \opt & \texttt{context.agent.goal} \\
+\texttt{task\_description}
+  & string & \opt & \texttt{context.task.description} \\
+\multicolumn{4}{l}{\textit{\textbf{generated} object}} \\
+\rowcolor{fieldgray}
+\texttt{response}
+  & string (max 4000 chars) & \req
+  & Full LLM response text from \texttt{context.response} \\
+\texttt{model}
+  & string & \req & Model that was used \\
+\multicolumn{4}{l}{\textit{\textbf{custom\_metadata} object}} \\
+\rowcolor{fieldgray}
+\texttt{model}       & string & \req & Model name \\
+\texttt{agent\_role} & string & \req & Agent role \\
+\rowcolor{fieldgray}
+\texttt{framework}   & string & \req & \texttt{"crewai"} \\
+\texttt{source}      & string & \req & \texttt{"llm\_hook"} — distinguishes from event-bus records \\
+\rowcolor{fieldgray}
+\multicolumn{4}{l}{\textit{Linkage}} \\
+\texttt{parent\_task\_id}
+  & uuid & \opt & Best-effort lookup of enclosing \subtype{crewai\_agent} \texttt{task\_id} \\
+
+\caption{\subtype{llm\_call} (CrewAI hook) record fields.}
+\end{longtable}
+
+\subsubsection{\subtype{tool\_call} (CrewAI hook)}
+\label{sec:tool-crewai}
+
+Emitted by \texttt{before\_tool\_call} + \texttt{after\_tool\_call} hooks.
+Tool inputs are \textbf{typed dicts} (not flat strings as in LangGraph).
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\multicolumn{4}{l}{\textit{\textbf{used} object}} \\
+\rowcolor{fieldgray}
+\texttt{input}
+  & object & \req
+  & \textbf{Typed} tool input dict from \texttt{context.tool\_input}
+    (richer than the LangGraph string) \\
+\texttt{agent\_role}
+  & string & \req & Agent role \\
+\rowcolor{fieldgray}
+\texttt{task\_description}
+  & string & \opt & \texttt{context.task.description} \\
+\multicolumn{4}{l}{\textit{\textbf{generated} object}} \\
+\rowcolor{fieldgray}
+\texttt{output}
+  & string (max 2000 chars) & \req & Tool result from \texttt{context.tool\_result} \\
+\multicolumn{4}{l}{\textit{\textbf{custom\_metadata} object}} \\
+\rowcolor{fieldgray}
+\texttt{tool\_name}  & string & \req & \texttt{context.tool\_name} \\
+\texttt{agent\_role} & string & \req & Agent role \\
+\rowcolor{fieldgray}
+\texttt{framework}   & string & \req & \texttt{"crewai"} \\
+\texttt{source}      & string & \req & \texttt{"tool\_hook"} \\
+\rowcolor{fieldgray}
+\multicolumn{4}{l}{\textit{Linkage}} \\
+\texttt{parent\_task\_id}
+  & uuid & \opt & Best-effort lookup of enclosing \subtype{crewai\_agent} \texttt{task\_id} \\
+
+\caption{\subtype{tool\_call} (CrewAI hook) record fields.}
+\end{longtable}
+
+% ------------------------------------------------------------
+\subsection{AutoGen Plugin (\texttt{flowcept\_autogen\_plugin.py})}
+% ------------------------------------------------------------
+
+\subsubsection{\subtype{autogen\_run}}
+
+One record per \texttt{team.run()} call, emitted after the stream finishes.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{used.task}
+  & string & \req & Task / initial message sent to the team \\
+\rowcolor{fieldgray}
+\texttt{generated.stop\_reason}
+  & string & \req & Stop reason from \texttt{TaskResult} \\
+\texttt{generated.message\_count}
+  & int    & \req & Total number of messages captured \\
+\rowcolor{fieldgray}
+\texttt{generated.last\_message}
+  & string & \req & Content of the last message (first 200 chars) \\
+\texttt{generated.messages}
+  & list[\{source, content\}] & \req
+  & Summary list of all captured messages \\
+\rowcolor{fieldgray}
+\texttt{custom\_metadata.team\_name}       & string & \req & Team name \\
+\texttt{custom\_metadata.framework}        & string & \req & \texttt{"autogen"} \\
+\rowcolor{fieldgray}
+\texttt{custom\_metadata.source\_agent\_id}& string & \opt
+  & Academy \texttt{AgentId} that produced the task input \\
+
+\caption{\subtype{autogen\_run} record fields.}
+\end{longtable}
+
+\subsubsection{\subtype{autogen\_message}}
+
+One record per message yielded by \texttt{run\_stream()}.
+
+\begin{longtable}{L{4cm} L{2.5cm} C{1.2cm} L{6.5cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Field} & \textbf{Type} & \textbf{P} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{used.task}    & string & \req & Original task prompt \\
+\rowcolor{fieldgray}
+\texttt{used.agent}   & string & \req & Source agent name \\
+\texttt{generated.content}
+  & string | object & \req & Message content \\
+\rowcolor{fieldgray}
+\texttt{generated.message\_type}
+  & string & \req & Python class name of the message object \\
+\texttt{custom\_metadata.agent\_name}   & string & \req & Source agent name \\
+\rowcolor{fieldgray}
+\texttt{custom\_metadata.message\_type} & string & \req & Message class name \\
+\texttt{custom\_metadata.framework}     & string & \req & \texttt{"autogen"} \\
+\rowcolor{fieldgray}
+\texttt{parent\_task\_id}
+  & uuid & \req & Enclosing \subtype{autogen\_run} \texttt{task\_id} \\
+
+\caption{\subtype{autogen\_message} record fields.}
+\end{longtable}
+
+% ============================================================
+\section{Cross-Framework Comparison}
+% ============================================================
+
+Table~\ref{tab:comparison} summarises the capabilities of each \subtype{llm\_call}
+variant and the \subtype{tool\_call} variants.
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabularx}{\textwidth}{L{4.5cm} C{2cm} C{2.5cm} C{2.5cm}}
+\toprule
+\textbf{Capability}
+  & \textbf{Academy}
+  & \textbf{LangGraph}
+  & \textbf{CrewAI (hook)} \\
+\midrule
+Full message list captured  & yes & yes (chat path) & yes (with roles) \\
+\rowcolor{fieldgray}
+Token counts                & yes & yes             & no \\
+Temperature details         & yes & no              & no \\
+\rowcolor{fieldgray}
+Agent context               & \texttt{ctx\_*} prefix & no & \texttt{agent\_role}, \texttt{agent\_goal} \\
+Task / hypothesis context   & \texttt{ctx\_hyp\_id}  & no & \texttt{task\_description} \\
+\rowcolor{fieldgray}
+ReAct iteration count       & no  & no              & yes (\texttt{iterations}) \\
+Structured output parsed    & yes (hoisted) & partial (inline JSON) & no \\
+\rowcolor{fieldgray}
+Linked to parent task       & \subtype{academy\_action} & \subtype{langgraph\_node} & \subtype{crewai\_agent} \\
+\midrule
+\textbf{Tool input type}    & n/a & string          & typed dict \\
+\rowcolor{fieldgray}
+Tool output captured        & n/a & yes             & yes \\
+Agent/task context in tool  & n/a & no              & yes \\
+\bottomrule
+\end{tabularx}
+\caption{Comparison of \subtype{llm\_call} and \subtype{tool\_call} across plugins.}
+\label{tab:comparison}
+\end{table}
+
+% ============================================================
+\section{Performance Overhead CSV}
+% ============================================================
+
+Each plugin optionally writes a per-call overhead CSV to
+\texttt{provenance\_perf\_<workflow\_id>.csv}.
+
+\begin{longtable}{L{3.5cm} L{2.5cm} L{7.5cm}}
+\toprule
+\textbf{Column} & \textbf{Type} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule \textbf{Column} & \textbf{Type} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+
+\texttt{timestamp\_utc} & ISO-8601 string & UTC time of the event \\
+\rowcolor{fieldgray}
+\texttt{workflow\_id}   & uuid string & Workflow this event belongs to \\
+\texttt{category}       & string
+  & One of: \texttt{action\_emit}, \texttt{loop\_emit},
+    \texttt{lifecycle\_emit}, \texttt{llm\_hook},
+    \texttt{intercept\_task}, \texttt{flush} \\
+\rowcolor{fieldgray}
+\texttt{elapsed\_us}    & float & Wall-clock overhead in microseconds \\
+
+\caption{Provenance overhead CSV columns.}
+\end{longtable}
+
+\end{document}
