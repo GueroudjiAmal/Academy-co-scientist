@@ -336,7 +336,7 @@ async def _launch_harvester_agents(
             ),
             **launch_kw,
         )
-        await agent.ping(timeout=30.0)
+        await agent.ping(timeout=60.0)
         if vectordb:
             await agent.set_vectordb(vectordb)
         agents.append(agent)
@@ -782,7 +782,7 @@ async def _run_simulator(
         if use_vectordb:
             launch_kw = {"executor": remote_exec} if remote_exec else {}
             vectordb = await manager.launch(ResearchVectorDBAgent, **launch_kw)
-            await vectordb.ping(timeout=30.0)
+            await vectordb.ping(timeout=60.0)
             logger.info("Launched ResearchVectorDBAgent (executor=%r)", remote_exec or "default")
 
         # --- Paper harvester (weekly, feeds vector DB) ---

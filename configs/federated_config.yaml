@@ -32,11 +32,11 @@ simulator:
     min_pass_score: 0.50
     max_refinement_rounds: 5
     interval: 60.0
-    max_cycles: 2
+    max_cycles: 1
 
   agents:
-    generation:  2
-    review:      3
+    generation:  1
+    review:      1
     tournament:  1
     vectordb:    1      # runs on Aurora (remote_exec = "aurora")
     harvester:   1      # runs on Aurora (remote_exec = "aurora")
@@ -77,19 +77,12 @@ simulator:
 
     executors:
       local:
-        type: thread
+        type: process
         max_workers: 16
 
       aurora:
         type: globus
-        endpoint_id: "0a2848fc-007e-4318-a929-4b9eb445236e"
-        user_endpoint_config:
-          # Activate the venv and set required env vars on Aurora workers.
-          # Adjust the path to match your Aurora project space.
-          worker_init: >-
-            . /lus/flare/projects/CSC249ADCD08/agueroudji/academy-coscientist/venv/bin/activate;
-            export ARGO_USER=agueroudji;
-            export ACADEMY_CONFIG_PATH=/lus/flare/projects/CSC249ADCD08/agueroudji/academy-coscientist/configs/federated_config.yaml
+        endpoint_id: "a101bcb5-8a2f-4bbc-a49b-5470c388c5c1"
 
 # -----------------------------------------------------------
 # Proof-of-concept agent
@@ -97,7 +90,7 @@ simulator:
 # PoC agents run locally (Docker).
 poc:
   enabled: true
-  top_n: 3
+  top_n: 1
   max_retries: 1
   output_dir: null
 
@@ -131,7 +124,7 @@ report:
 # Argo mode routes all LLM calls through the ANL gateway.
 # Disable and set OPENAI_API_KEY / ANTHROPIC_API_KEY to use
 # direct API calls from any machine.
-argo_mode: true
+argo_mode: false
 argo_user: "agueroudji"
 
 # When argo_mode is true but an Argo call fails (network error, auth failure,
